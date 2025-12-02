@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>statenav_global</name>
+  <version>0.0.1</version>
+  <description>STATE-NAV Global Mapping and Planning: A Python Library for Global Navigation</description>
+
+  <maintainer email="zyoon6@gatech.edu">Ziwon Yoon</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  
+  <!-- ROS dependencies -->
+  <build_depend>roscpp</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
+  <build_depend>grid_map_msgs</build_depend>
+  
+  <build_export_depend>roscpp</build_export_depend>
+  <build_export_depend>rospy</build_export_depend>
+  <build_export_depend>std_msgs</build_export_depend>
+  <build_export_depend>geometry_msgs</build_export_depend>
+  <build_export_depend>nav_msgs</build_export_depend>
+  <build_export_depend>grid_map_msgs</build_export_depend>
+  
+  <exec_depend>roscpp</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>grid_map_msgs</exec_depend>
+
+  <export>
+    <!-- Python package -->
+    <python_module>statenav_global</python_module>
+  </export>
+</package>
