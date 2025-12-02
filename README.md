@@ -1,4 +1,4 @@
-# STATE-NAV: Stability-Aware 
+# STATE-NAV: STATE-NAV: Stability-Aware Traversability Estimation for Bipedal Navigation on Rough Terrain
 
 ## Overview
 ![Teaser image](./images/teaser.png)
