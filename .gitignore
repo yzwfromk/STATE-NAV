@@ -1,0 +1,8 @@
+dist/
+
+*.egg-info
+*.pyc
+*.egg
+PKG-INFO
+*.pdf
+docker/.etc/
