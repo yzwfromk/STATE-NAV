@@ -1,120 +1,208 @@
+# Random seed for reproducibility (set to 0 for deterministic behavior)
 seed: 0
 
 
-# Environment and Start and Goal
-env_extent: [-5, 5, -5, 5] # [xmin, xmax, ymin, ymax]
-# environment extent should be slightly larger than task extent
-# otherwise, the robot might go out of boundary and cannot access matrix value
-# If env or global start becomes 0 if gets weird. 
+# ==================== Environment and Start/Goal Configuration ====================
+# Environment extent defines the boundaries of the planning space
+# Format: [xmin, xmax, ymin, ymax] in meters
+env_extent: [-1, 9, -3, 3] # [xmin, xmax, ymin, ymax]
+# Note: Environment extent should be slightly larger than task extent
+#       otherwise, the robot might go out of boundary and cannot access matrix value
+# Known Issues:
+#   - Bug: If env or global start becomes 0, behavior gets weird
+#   - Bug: If env_extent is not an integer multiple of trav_estimation_resolution, 
+#          something goes wrong.
+# Should be fixed in the future.
 
-initial_start:   [1, -4.5]
-global_goal:    [1.5, 4.5] 
-heading_start:  90
+# Initial starting position of the robot [x, y] in meters (in world frame)
+initial_start:   [0, 0]
 
+# Global goal position [x, y] in meters (in world frame)
+global_goal:    [8, 0] 
 
-# Hills
-# [-4.5, 1]
-# [3.5, 0.5]
-# 0
-# Const
-# [1, -4.5]
-# [1.5, 4.5] 
-# 90
-# urban
-# [4.4, 4.6]
-# [-4, 0]   
-# -135
-# showcase
-# [-4.5, 4.5]
-# [4.5, -4.5]   
-# -45
-
-# Hardware
-# [0, 0]
-# [5, 0]   
-# 0
+# Initial heading/orientation of the robot in radians (0 = facing positive x-axis)
+heading_start:  0
 
 
-# Mapping
-trav_estimation_resoultion: 0.5 # m
-local_patch_size: 0.64  # m
+# ==================== ROS Integration Configuration ====================
+# Enable/disable RRT* global planning
+# If False: RRT* doesn't run and only mapping works when you run main_traversability_estimation.py
+do_RRT_globalplanning: True
 
-# ROS-related
-frame_id: 'map' # World frame id
+# Enable asynchronous global planning
+# If False: Global planning is done synchronously together with the mapping when you run main_traversability_estimation.py
+# If True: Global planning runs asynchronously (non-blocking). You need to run main_global_planning.py to get the global path.
+asynchronous_globalplanning: True
+
+# ROS frame ID for the world/map frame (typically 'map' or 'odom')
+frame_id: 'map'
+
+# Map layers to use for planning
+# Options: ['inpaint', 'smooth'] - specifies which map processing layers to utilize
 which_layer: ['inpaint', 'smooth']
-# which_layer: ['smooth']
-mean_over_maps: True # If false, the first layer is used for data and the second layer is used for deciding if it is NaN
 
-elevation_diff_threshold: 0.03
-RandomRate_TravUpdate: 0.3
-initialization_time: 20
+# Whether to take mean over multiple map layers
+# If False: First layer is used for data, second layer is used for NaN detection
+# If True: Mean is computed over all specified layers
+mean_over_maps: True
 
-# ROS Publishing
-use_gridmap_msg: 1  # True for GridMap, False for Float32MultiArray
-pub_locally: False # if false, the entire map is published
+# ==================== ROS Publishing Configuration ====================
+# Message type for traversability map publishing
+# 1 (True): Use GridMap message type
+# 0 (False): Use Float32MultiArray message type
+use_gridmap_msg: 1
+
+# Whether to publish only local traversability map region or entire map
+# False: Publish the entire map
+# True: Publish only local region around robot and to a local waypoint
+pub_locally: False
+
+# Multiplier for local map horizon when getting a waypoint
+# Determines how far ahead to look when extracting local map for waypoint planning
 localmap_getwaypoint_horizonmultiplier: 2.5
-savemap: 1 # save the map as png once 
+
+# Whether to save the map as PNG image
+# 1 (True): Save map once as PNG
+# 0 (False): Don't save map
+savemap: 1
+
+# Enable debugging visualization of the maps
 debugging_visualization: False 
 
-# Traversability 
-trav_option: 'Proposed' #['Proposed', 'IHMC', 'Quadruped'] # change default_travelcost in the planner_config.yaml
-planner_option: 'safecmd' # ['safecmd', 'score']
-local_cmd_option: 'score_travcmd' #[max, 'score_travcmd']
-# TAKE CARE OF MAX OPTION, SINCE IT IS NOT FULLY TESTED IN THE NEW CODE STRUCTURE YET
-
-# safe cmd planner
-maximum_cmd_v: 0.5
-maximum_cmd_w: 0.3
-default_safe_cmd_v: 0.248 # Should not be an integer multiplier of v_res = maximum_cmd_v/num_commands
-default_safe_cmd_w: 0.148
-toorisky_v: 0.0001
-toorisky_w: 0.0001
-obstacle_cmd_v_threshold: 0.1
-num_commands: 10
-
-instability_limit: 3
-instability_std_multiplier: 2
 
 
-####################### Hardware Configurations #######################
-# Perception
-ptcloud_publishers_list:  ['zed'] #['lidar', 'depth_shoulder', 'depth_torso'] #, 'zed']
+# ==================== Traversability Estimation Configuration ====================
+# Resolution for traversability estimation grid in meters
+# 0.5m resolution is recommended for good balance between accuracy and computation
+# Note: env_extent should be an integer multiple of this value
+trav_estimation_resoultion: 0.5
 
-yaw_offset: 1.353
-pos_offset: [0, 0, 1]
-# If Digit pose is [r, p, y, a, b, c]
-# then -> yaw = -y, pos = (0,0,h) - (a,b,c)
+# Local patch size in meters (DO NOT CHANGE)
+# The learned neural network model is trained with:
+#   - local_patch_size = 0.64m
+#   - map_resolution = 0.04m
+#   - Taking 16x16 patches
+# Changing any of these parameters will require retraining the model
+local_patch_size: 0.64
 
+# Traversability Estimation Update Parameters
+# Maximum elevation difference threshold for triggering traversability estimation update
+elevation_diff_threshold: 0.03
 
+# Random rate for traversability map updates of non-triggered cells (0.0 to 1.0). Higher values = more frequent revisit of already estimated or non-triggered cells.
+RandomRate_TravUpdate: 0.3
+
+# Initialization time in seconds
+# Time to wait before starting traversability estimation (wait to get elevation map stabilized)
+initialization_time: 20
 
 
 ####################### Planning Configurations #######################
-# score-based planner
+# ==================== Traversability - Planning Related ====================
+# Traversability estimation method to use
+# Options: 'Proposed' (uses proposed method), or other methods
+trav_option: 'Proposed'
+
+# Planner type selection
+# Options: 'safecmd' (safe command-based planner. Proposed method), 'score' (score-based planner. traditional planning method)
+planner_option: 'safecmd'
+
+# command velocity selection method
+# This doesnt matter if you are using the safecmd planner.safecmd planner has traversability as velocity, therefore no need to do anything more.
+# This matters if you are using the score planner.
+# Options: 'max' (just use maximum velocity), 'score_travcmd' (get inverse of traversability score and use it as a command velocity constraint)
+# WARNING: 'max' option is NOT fully tested in the new code structure yet
+local_cmd_option: 'score_travcmd'
+
+# ==================== Safe Command-Based Planner Parameters ====================
+# Maximum linear velocity command in m/s
+maximum_cmd_v: 0.5
+
+# Maximum angular velocity command in rad/step. To convert to rad/s, divide by step_T, which is 0.75
+maximum_cmd_w: 0.3
+
+# Default safe linear velocity in m/s. 0.25 is a neutral guess, which is a half of maximum velocity.
+default_safe_cmd_v: 0.248
+
+# Default safe angular velocity in rad/s
+default_safe_cmd_w: 0.148
+
+# When the sweeping down of command velocity fails, the command velocity is set to this value.
+toorisky_v: 0.001
+toorisky_w: 0.001
+
+# Commands below this threshold may be considered as obstacles.
+obstacle_cmd_v_threshold: 0.1
+
+# Number of discrete command options to sample. \Delta a in Fig.3
+# Higher values = finer command resolution but more computation
+num_commands: 10
+
+# Instability limit parameters \delta_limit in eq.3,4
+instability_limit: 3
+
+# Standard deviation multiplier for uncertainty compensation. Something like \alpha in eq. 3,4 
+# Higher values = more conservative uncertainty compensation
+instability_std_multiplier: 2
+
+# ==================== Score-Based Planner Parameters ====================
+# Weight for cost function in score-based planning. 'w' in cij = \Sigma k∈M (1 + w(1/tk)^p) ∆lk
+# Higher values = more emphasis on traversability, compared to path length.
 cost_weight: 3
+
+# Power/exponent for cost function. 'p' in cij = \Sigma k∈M (1 + w(1/tk)^p) ∆lk
 cost_power: 1
-scorebased_safe_cmd_v: 0.25 # should be = maximum_cmd_v * 0.5(=initial guess score)
+
+# Safe linear velocity for score-based planner (m/s)
+# Should be = maximum_cmd_v * 0.5 (where 0.5 is the initial guess score)
+scorebased_safe_cmd_v: 0.25
+
+# Safe angular velocity for score-based planner (rad/s)
 scorebased_safe_cmd_w: 0.15
 
 
-## Planning
-do_RRT_globalplanning: True # if false, RRT* doesnt run and only mapping works
-asynchronous_globalplanning: True # if false, global planning is done together with the mapping
 
 
+# ==================== RRT* Global Path Planning Parameters ====================
+# Goal radius as a ratio of the environment extent
+# Smaller values = more precise goal reaching, but may take longer
+# Format: ratio (e.g., 0.05 = 5% of environment extent)
+goal_radius_ratio: 0.05
 
-# RRT*
-goal_radius_ratio: 0.05 # ratio of the goal radius to the environment extent
+# Iteration number to switch from TravRRT* to informed RRT* around the found path
+# This Around-path-informed RRT is a kind of fine-tuning of the found path.
+# Before this, TravRRT* does global path finding toward more navigable areas.
+# If 0: Around-path-informed RRT is not used. Trav-informed RRT is used
+# If > 0: Switches to informed sampling around the found path after this many iterations
+# Higher values = more TravRRT* to find globally optimal path, and less fine-tuning around the found path
+switch_to_informed_from_thisiter: 360
 
-switch_to_informed_from_thisiter: 360 # if 0, vanilla RRT is used
+# Maximum number of RRT* iterations
+# Higher values = better paths but more computation time
 iter_max: 400
-branch_length_max_ratio: 0.1
-search_radius_ratio: 0.8
+
+# Convergence ratio threshold
+# RRT* stops early if path improvement is below this ratio
+# Smaller values = more iterations before convergence
 convergence_ratio: 0.001
 
-RRT_getwaypoint_steps: 10
+# Maximum branch length as a ratio of environment extent
+# Controls maximum distance a new node can be from nearest node
+# Format: ratio (e.g., 0.1 = 10% of environment extent)
+branch_length_max_ratio: 0.1
 
+# Search radius ratio for RRT* rewiring
+# Controls how far to search for nodes to rewire when optimizing path
+# Format: ratio (e.g., 0.8 = 80% of environment extent)
+# Large value is required to overcome the violation of Lipschitz assumption in RRT*.
+search_radius_ratio: 0.8
 
-sampling_dist: 0.1  # m
+# Sampling distance for edge discretization in meters when calculating edge cost btwn nodes. eq. 5
+sampling_dist: 0.1
+
+# Number of sampling points (None = auto-calculate based on sampling_dist)
+# If None: Automatically determined from sampling_dist and path length
+# If specified: Fixed number of waypoints to extract
 num_samplingpoints: None
 
 
@@ -124,40 +212,27 @@ num_samplingpoints: None
 
 
 
-
-## MPC
-MPC_horizon: 7
-robust_horizon: 0
-
-ub_u_ddtheta: 0.03
-
-# waypoint
-getwaypoint_ratio: 1.2
-
-# get_cmd_limit
+# ==================== Command Velocity Constraints: get_cmd_limits parameters ====================
+# Lookahead distance in meters
+# Distance ahead of robot to consider when calculating command velocities constraints
 lookahead_distance: 1.5
-lookahead_angle: 30 # deg
+
+# Lookahead angle in degrees
+# Angular range to consider when calculating command velocities constraints (symmetric around current heading)
+lookahead_angle: 30
+
+# Sampling distance for command velocities constraints in meters
 safecmd_sampling_dist: 0.1
 
-num_obs: 3
+# ==================== get_waypoint ====================
+# This is for get_waypoint, taking into account the time period of a bipedal gait cycle. No need to change in general.
+step_T: 0.4
 
-# debug
-debug_print: False
-print_until_t: 5
-global_view: False
-local_view_radius: 3.4
+MPC_horizon: 7
 
-obs_clearance: 0.1  # m
-
-
-
-
-## Controller
-step_T: 0.45
+# Number of walking steps to lookahead for getting waypoints from RRT* path
+# Higher values = further waypoint
+RRT_getwaypoint_steps: 10
 
 
 
-
-
-
-#
