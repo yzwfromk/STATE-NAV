@@ -340,16 +340,6 @@ def main():
                             goal_x=global_goal[0], goal_y=global_goal[1],
                             which_layer = cfg.which_layer,
                             preest_update_resolution=cfg.trav_estimation_resoultion, instab_limit = cfg.instability_limit) # 0.37
-    elif cfg.trav_option == "IHMC":
-        global_map = IHMCMap(env_xmin=cfg.env_extent[0], env_xmax=cfg.env_extent[1], env_ymin=cfg.env_extent[2], env_ymax=cfg.env_extent[3],
-                            goal_x=global_goal[0], goal_y=global_goal[1],
-                            which_layer = cfg.which_layer,
-                            preest_update_resolution=cfg.trav_estimation_resoultion, instab_limit = cfg.instability_limit) # 0.37
-    elif cfg.trav_option == "Quadruped":
-        global_map = QuadrupedMap(env_xmin=cfg.env_extent[0], env_xmax=cfg.env_extent[1], env_ymin=cfg.env_extent[2], env_ymax=cfg.env_extent[3],
-                            goal_x=global_goal[0], goal_y=global_goal[1],
-                            which_layer = cfg.which_layer,
-                            preest_update_resolution=cfg.trav_estimation_resoultion, instab_limit = cfg.instability_limit) # 0.37
     else:
         raise ValueError(f"Invalid trav_option: {cfg.trav_option}")
 
@@ -409,7 +399,7 @@ def main():
     search_radius = cfg.search_radius_ratio * diagonal
     decrease_search_radius = True
 
-    if not asynchronous_globalplanning:
+    if do_RRT_globalplanning and not asynchronous_globalplanning:
         global_planner = statenav_global.planners.GlobalRRTStar(
                     cfg.task_extent, rng, initial_start, global_goal, heading_start,
                     goal_radius = diagonal * cfg.goal_radius_ratio, branch_length_max=branch_length_max, search_radius=search_radius, decrease_search_radius=decrease_search_radius, \
@@ -445,15 +435,15 @@ def main():
 
         if rospy.get_time() > initialization_time:
 
-            if asynchronous_globalplanning:
-                global_map.Update_map(visualize_map=debugging_visualization)
-            else:
+            if do_RRT_globalplanning and not asynchronous_globalplanning:
                 global_map.Update_map(global_planner.path, visualize_map=debugging_visualization)
+            else:
+                global_map.Update_map(visualize_map=debugging_visualization)
 
 
             if global_map.is_TraversabilityMap_built:
                 
-                if not asynchronous_globalplanning:
+                if do_RRT_globalplanning and not asynchronous_globalplanning:
                     global_planner.replan(global_map, initial_start=(initial_start[0], initial_start[1]), step_T=step_T, RRT_getwaypoint_steps=RRT_getwaypoint_steps, plot_map=False)
 
                 # ==================================== ROS Publishing ====================================
@@ -474,7 +464,7 @@ def main():
                 obstacle_list_pub.publish(obstacle_list_topic)
 
 
-                if not asynchronous_globalplanning:
+                if do_RRT_globalplanning and not asynchronous_globalplanning:
 
 
                     global_path_msg = Path()

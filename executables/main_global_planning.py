@@ -311,30 +311,6 @@ class PlanningNode:
                 instab_limit=self.cfg.instability_limit,
                 load_NN = False
             )
-        elif self.cfg.trav_option == "IHMC":
-            self.global_map = IHMCMap(
-                env_xmin=self.cfg.env_extent[0], 
-                env_xmax=self.cfg.env_extent[1], 
-                env_ymin=self.cfg.env_extent[2], 
-                env_ymax=self.cfg.env_extent[3],
-                goal_x=global_goal[0], 
-                goal_y=global_goal[1],
-                which_layer=self.cfg.which_layer,
-                preest_update_resolution=self.cfg.trav_estimation_resoultion, 
-                instab_limit=self.cfg.instability_limit
-            )
-        elif self.cfg.trav_option == "Quadruped":
-            self.global_map = QuadrupedMap(
-                env_xmin=self.cfg.env_extent[0], 
-                env_xmax=self.cfg.env_extent[1], 
-                env_ymin=self.cfg.env_extent[2], 
-                env_ymax=self.cfg.env_extent[3],
-                goal_x=global_goal[0], 
-                goal_y=global_goal[1],
-                which_layer=self.cfg.which_layer,
-                preest_update_resolution=self.cfg.trav_estimation_resoultion, 
-                instab_limit=self.cfg.instability_limit
-            )
         else:
             raise ValueError(f"Invalid trav_option or planner_option: {self.cfg.trav_option} or {self.cfg.planner_option}")
         
