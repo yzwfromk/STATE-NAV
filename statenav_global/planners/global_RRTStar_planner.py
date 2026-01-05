@@ -508,12 +508,11 @@ class GlobalRRTStar(BasePlanner):
         self.plotting.xI = (self.s_start.x, self.s_start.y)
         self.plotting.xG = (self.s_goal.x, self.s_goal.y)
 
-    def replan(self, global_map, initial_start=None, step_T=0.4, RRT_getwaypoint_steps=10, plot_map=False):
+    def replan(self, initial_start=None, step_T=0.4, RRT_getwaypoint_steps=10, plot_map=False):
 
 
         if self.global_map.is_TraversabilityMap_built:
             
-            self.global_map = global_map
             # ==================================== Global Planning ====================================
 
             start_time = time.time()

@@ -406,7 +406,7 @@ def main():
                     iter_max=iter_max_global, convergence_threshold=cfg.convergence_ratio,
                     switch_to_informed_from_thisiter = cfg.switch_to_informed_from_thisiter, sampling_dist=cfg.sampling_dist, num_samplingpoints=cfg.num_samplingpoints,
                     default_obstacle_clearance=cfg.obs_clearance)
-        global_planner.global_map = global_map
+        global_planner.global_map = global_map # pass by reference
 
         print("Initialized planner GlobalRRTStar")
     else:
@@ -444,7 +444,7 @@ def main():
             if global_map.is_TraversabilityMap_built:
                 
                 if do_RRT_globalplanning and not asynchronous_globalplanning:
-                    global_planner.replan(global_map, initial_start=(initial_start[0], initial_start[1]), step_T=step_T, RRT_getwaypoint_steps=RRT_getwaypoint_steps, plot_map=False)
+                    global_planner.replan(initial_start=(initial_start[0], initial_start[1]), step_T=step_T, RRT_getwaypoint_steps=RRT_getwaypoint_steps, plot_map=False)
 
                 # ==================================== ROS Publishing ====================================
 

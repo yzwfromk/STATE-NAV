@@ -259,7 +259,7 @@ def populate_map_from_gridmap(global_map, msg):
 
 
 
-
+# Todos: Make the global_map a shared memory between the main_traversability_estimation.py and main_global_planning.py
 
 
 
@@ -427,7 +427,7 @@ class PlanningNode:
         
         try:
             
-            self.global_planner.replan(self.global_map, initial_start=(self.initial_start[0], self.initial_start[1]), step_T=self.step_T, RRT_getwaypoint_steps=self.RRT_getwaypoint_steps, plot_map=False)
+            self.global_planner.replan(initial_start=(self.initial_start[0], self.initial_start[1]), step_T=self.step_T, RRT_getwaypoint_steps=self.RRT_getwaypoint_steps, plot_map=False)
             # Publish path
             self.publish_path()
             
