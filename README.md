@@ -1,11 +1,16 @@
 # STATE-NAV: Stability-Aware Traversability Estimation for Bipedal Navigation on Rough Terrain
-
+It is under active development! We will soon come up with ROS2 version. + We are actively working on adding more features.
 ## Overview
 ![example image](./images/running_example.png)
 
 **STATE-NAV** is the first learning-based traversability estimation and navigation framework for humanoids on diverse rough terrain. It learns a stability-aware velocity-based traversability representation of terrain by carefully selecting a self-supervised locomotion signal for bipedal locomotion and integrates this knowledge into a hierarchical planning framework for safe and efficient navigation.
 
 ![Teaser image](./images/teaser.png)
+
+### Practical sub-module use cases
+- **Get TravRRT for Terrain Navigation**: A computationally efficient RRT* for terrain navigation with traversability. Theoretically, RRT* assumes Lipschitz-continuous costs, which break on rough terrain where traversability changes abruptly, and forcing large rewiring radius. TravRRT* avoids this by biased sampling toward high-traversability regions—much like how humans just ignore infeasible paths (you don’t even think about walking through a bush, do you?). (Why not A*? yaw angle makes the search 3D! High computation. And also, heuristics for computing h(x).)
+  
+- **Get Bipedal Traversability for Humanoids**: An off-the-shelf bipedal traversability map—insert an elevation map, receive a traversability map.
 
 
 ### Why STATE-NAV?
