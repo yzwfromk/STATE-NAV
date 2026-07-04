@@ -1,5 +1,9 @@
 # STATE-NAV: Stability-Aware Traversability Estimation for Bipedal Navigation on Rough Terrain
 
+## Update News!
+[Jul 04 2026] ROS2 version with Docker setting, ROS2 bag, etc. available! 
+Also major updates and refactoring in code: now ~10x faster running.
+
 ## Overview
 ![example image](./images/running_example.png)
 
