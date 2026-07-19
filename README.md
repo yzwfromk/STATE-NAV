@@ -1,8 +1,11 @@
 # STATE-NAV: Stability-Aware Traversability Estimation for Bipedal Navigation on Rough Terrain
 
 ## Update News!
+Now working on adding A* (path would be discrete but is faster than RRT* by 100x for the attached ROSbag env) and integrating STATE-NAV's bipedal traversability with VLN - VAMOS (https://vamos-vla.github.io/)
+
 [Jul 04 2026] ROS2 version with Docker setting, ROS2 bag, etc. available! 
 Also major updates and refactoring in code: now ~10x faster running.
+Checkpoint for Unitree G1's blind locomotion controller released.
 
 ## Overview
 ![example image](./images/running_example.png)
