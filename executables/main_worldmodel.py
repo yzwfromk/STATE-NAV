@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ast
 import numpy as np
 import os
 from omegaconf import OmegaConf
@@ -7,10 +8,12 @@ from pathlib import Path as PathLib
 import statenav_global
 from statenav_global.world_model import *
 import statenav_global.world_model.WorldModel as WorldModel
+import statenav_global.world_model.globalmap as globalmap_module
 from statenav_global.utility.ros_utils import publish_costmap_float32multiarray, publish_costmap_gridmap, Rviz_vis_travmap
 
 import rclpy
 import rclpy.parameter
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from rclpy.clock import ClockType
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -25,6 +28,29 @@ import warnings
 warnings.simplefilter(action='ignore', category=RuntimeWarning)
 
 cfg = OmegaConf.load(PathLib(statenav_global.__file__).parent / "configs/planning_config.yaml")
+
+
+def parse_xy_override(value, name):
+    if isinstance(value, str):
+        raw_value = value.strip()
+        if not raw_value:
+            return None
+
+        try:
+            value = ast.literal_eval(raw_value)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError(f"{name} must be formatted as [x,y], got: {raw_value}") from exc
+
+    if value is None:
+        return None
+
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{name} must contain exactly two values, got: {value}")
+
+    try:
+        return [float(value[0]), float(value[1])]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} values must be numeric, got: {value}") from exc
 
 
 class WorldModelNode(Node):
@@ -61,6 +87,19 @@ class WorldModelNode(Node):
 
         cfg_path = PathLib(statenav_global.__file__).parent / "configs/planning_config.yaml"
         self.cfg = OmegaConf.load(cfg_path)
+        xy_parameter_descriptor = ParameterDescriptor(dynamic_typing=True)
+        self.declare_parameter("start", "", descriptor=xy_parameter_descriptor)
+        self.declare_parameter("goal", "", descriptor=xy_parameter_descriptor)
+        start_override = parse_xy_override(self.get_parameter("start").value, "start")
+        goal_override = parse_xy_override(self.get_parameter("goal").value, "goal")
+        if start_override is not None:
+            self.cfg.initial_start = start_override
+            self.get_logger().info(f"[WorldModel] Overriding initial_start from launch: {start_override}")
+        if goal_override is not None:
+            self.cfg.global_goal = goal_override
+            self.get_logger().info(f"[WorldModel] Overriding global_goal from launch: {goal_override}")
+        WorldModel.cfg = self.cfg
+        globalmap_module.cfg = self.cfg
 
         print("=" * 80)
 

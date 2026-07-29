@@ -18,7 +18,7 @@ echo "Running initial setup..."
 # =============================================================================
 HOST_HOME_DIR="${HOST_HOME_DIR:-$HOME}"
 
-STATENAV_SRC="${STATENAV_SRC:-${HOST_HOME_DIR}/Desktop/ros2_ws/statenav_ws/src/state_nav}"
+STATENAV_SRC="${STATENAV_SRC:-${HOST_HOME_DIR}/ros2_ws/statenav_ws/src/state_nav}"
 STATENAV_WS="${STATENAV_WS:-$(cd "$(dirname "${STATENAV_SRC}")/.." && pwd)}"
 # =============================================================================
 

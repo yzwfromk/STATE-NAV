@@ -2,6 +2,7 @@
 import io
 import os
 import re
+from glob import glob
 from typing import List
 
 from setuptools import find_packages, setup
@@ -68,6 +69,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + 'statenav_global']),
         ('share/statenav_global', ['package.xml']),
+        (os.path.join('share', 'statenav_global', 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', 'statenav_global', 'rviz'), glob('ROS/*.rviz')),
     ],
     entry_points={
         'console_scripts': [

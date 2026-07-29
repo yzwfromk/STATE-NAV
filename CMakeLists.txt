@@ -16,7 +16,7 @@ ament_python_install_package(${PROJECT_NAME})
 
 # Install Python executables
 install(PROGRAMS
-  executables/main_traversability_estimation.py
+  # executables/main_traversability_estimation.py
   executables/main_global_planning.py
   executables/main_worldmodel.py
   executables/main_multiprocess.py
