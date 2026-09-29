@@ -1,9 +1,8 @@
 from .base_planner import BasePlanner  # isort: skip
-from .global_RRTStar_planner import GlobalRRTStar
+from .global_AStar_planner import GlobalAStar
 
 
 __all__ = [
     "BasePlanner",
-    "GlobalRRTStar",
+    "GlobalAStar",
 ]
-

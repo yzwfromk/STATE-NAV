@@ -1,147 +1,205 @@
 seed: 0
 
 
-# Environment and Start and Goal
+####################### Environment Configurations #######################
+# env_extent: [-6, 6, -6, 6] # [xmin, xmax, ymin, ymax]
 env_extent: [-7, 7, -7, 7] # [xmin, xmax, ymin, ymax]
-# environment extent should be slightly larger than task extent
-# otherwise, the robot might go out of boundary and cannot access matrix value
-# If env or global start becomes 0 if gets weird. 
 
-initial_start:   [-6, 0]
-global_goal:    [3, 0] 
-heading_start:  0
+# keep the following
+# scene: construction
+# initial_start:   [-0.74, -3.0]
+# global_goal:    [5.4, 4.05] 
+# heading_start:  90
 
+# initial_start:   [-0.5, -2.5]
+# global_goal:    [5, -0.5]
+# heading_start:  45
 
-# Hills
-# [-4.5, 1]
-# [3.5, 0.5]
-# 0
-# Const
-# [1, -4.5]
-# [1.5, 4.5] 
-# 90
-# urban
-# [4.4, 4.6]
-# [-4, 0]   
-# -135
-# showcase
-# [-4.5, 4.5]
-# [4.5, -4.5]   
-# -45
+initial_start: [-2.0, -0.0]
+global_goal: [5.5, 0.8]
+heading_start:  10.0
 
-# Hardware
-# [0, 0]
-# [5, 0]   
-# 0
+####################### Initialization Window #######################
+initialization_time: 17.0
+# Init-window layout. The window is SCHEDULED BY THE FSM and COMMANDED BY THE LOCAL PLANNER:
+# NavigationFSM derives the three phase boundaries below from /clock and publishes the phase on
+# /fsm_state, and Bipedal_Planning_MPC issues every /robot/cmd_vel of that phase. IsaacLab takes no
+# part in the init motion any more - it publishes /clock from step 0 and gates the cloud, nothing
+# else.
+#   INITIALIZATION_SETTLING  [0, cloud_settle_time)                                    zero command
+#   INITIALIZATION_ROTATE    [cloud_settle_time, initialization_time - init_hold_time)  yaw sweep
+#   INITIALIZATION_HOLD      [initialization_time - init_hold_time, initialization_time)  zero cmd
+#   WP_TRACKING              >= initialization_time
+# cloud_settle_time + one full sweep + init_hold_time must fit inside initialization_time; the FSM
+# checks that at startup and warns (it does not raise) when a minimal sweep cannot fit.
+init_yaw_rate: 1.0            # rad/s commanded during INITIALIZATION_ROTATE (read by the local planner)
+init_yaw_amplitude_deg: 90.0  # sweep half-range: 0 -> +amp -> -amp -> 0, i.e. 4*amp of total rotation
+init_hold_time: 1.0           # s of motionless hold at the END of the window (read by the FSM)
+# Settle hold for the depth point cloud. DOUBLE DUTY: it is both the sim's cloud-publish gate (no
+# /robot/aggregated_cloud is published before it, so the elevation map is never seeded by frames
+# taken while the base is still settling from the spawn) and the FSM's SETTLING phase, so the robot
+# stands still for exactly as long as the cloud is withheld and the sweep starts as the first cloud
+# goes out. The camera rides the pelvis: a frame at tilt eps writes range*tan(eps) of phantom
+# relief, and elevation_mapping trusts the FIRST measurement of a cell at ~97% weight at 8 m, so
+# those frames would define the far field for the whole episode. Measured spawn transient: 4.2 deg
+# pitch in the first second (0.59 m at 8 m), 0.9 deg after 1.5 s, 0.6 deg after 2.0 s. Only the
+# cloud waits; /clock, pose, /tf, rgb and depth publish from step 0. Raising this delays the sweep
+# by the same amount.
+# Must stay below initialization_time: a settle hold that outlasts the init window would leave
+# the world model with an empty elevation map when the first replan is released.
+cloud_settle_time: 3.0
 
-
-savemap: 1 # save the map as png once
-debugging_visualization: true
+####################### Mapping ssand World Model Configurations #######################
+## WorldModel Main Loop Rate (main_worldmodel.py)
+# CAUTION: worldmodel_rate_hz sets the sleep cadence of WorldModelNode.run().
+#          Without it the loop free-runs, pins a full core, starves the rclpy.spin thread (GIL),
+#          and republishes /replanning_signal on every iteration.
+#          If a loop body overruns the period, Rate.sleep() returns immediately (no catch-up),
+#          so the loop simply degrades to its real cost instead of queuing up.
+worldmodel_rate_hz: 2        # (Hz) WorldModel main loop rate
+# Master switch for every debug figure (world-model maps and the global-planner debug view).
+debugging_visualization: True
 map_visualization_interval: 1.0  # seconds between map visualization updates
 
 
-####################### Mapping Configurations #######################
 # Mapping
 trav_estimation_resoultion: 0.5 # m
 local_patch_size: 0.64  # m
+# Sharpness k of the sigmoid S-curve used to interpolate traversability values between
+# adjacent coarse estimation-lattice corners when upsampling to the fine map grid.
+# Curve sig(t)=1/(1+exp(-k*(t-0.5))), normalized so f(0)=0, f(0.5)=0.5, f(1)=1.
+# Representative values:
+#   k -> 0   → nearly linear interpolation (constant slope between corners)
+#   k = 5    → moderate S-curve: gentle plateaus near corners, smooth mid transition (default)
+#   k >= 20  → near step / nearest-neighbor: sharp blocky transition around the midpoint
+interp_sigmoid_k: 5.0
+instability_limit: 1.6
+instability_std_multiplier: 3.5
 
-# ROS-related
-frame_id: 'map' # World frame id
-#which_layer: ['min_filter', 'inpaint']
-which_layer: ['neural_inpaint']
-mean_over_maps: True # If false, the first layer is used for data and the second layer is used for deciding if it is NaN
 
-elevation_diff_threshold: 0.03
-RandomRate_TravUpdate: 0.3
-initialization_time: 1
-
-# ROS Publishing
-use_gridmap_msg: 1  # True for GridMap, False for Float32MultiArray
-pub_travmap_visualization: True  # publish /travmap_visualization GridMap (elevation + north cmd_v) for Rviz2, at max 0.5 Hz
-
-# Traversability 
-# The default planner option is safecmd mode
-trav_option: 'Proposed' 
-
-# safe cmd planner
-maximum_cmd_v: 2
-maximum_cmd_w: 1
-default_safe_cmd_v: 1.0 # Should not be an integer multiplier of v_res = maximum_cmd_v/num_commands
+maximum_cmd_v: 1.5
+maximum_cmd_w: 1.5
+default_safe_cmd_v: 0.75 # Should not be an integer multiplier of v_res = maximum_cmd_v/num_commands
 default_safe_cmd_w: 0.5
-toorisky_v: 0.0000001
-toorisky_w: 0.0000001
+toorisky_v: 0.01
+toorisky_w: 0.01
 TreatObs_cmd_v: 0.3
 num_commands: 10
 
-instability_limit: 1.5
-instability_std_multiplier: 2.1
 
-####################### Hardware Configurations #######################
-# Perception
-ptcloud_publishers_list:  ['zed'] #['lidar', 'depth_shoulder', 'depth_torso'] #, 'zed']
+# ROS-related
+frame_id: 'map' # World frame id
+which_layer: ['neural_inpaint']
 
-yaw_offset: 1.353
-pos_offset: [0, 0, 1]
-# If Digit pose is [r, p, y, a, b, c]
-# then -> yaw = -y, pos = (0,0,h) - (a,b,c)
+elevation_diff_threshold: 0.05
+RandomRate_TravUpdate: 0.1
+
+
+use_shared_memory: True
+use_gridmap_msg: true  # True for GridMap, False for Float32MultiArray
+pub_travmap_visualization: True  # publish /travmap_visualization GridMap (elevation + north cmd_v) for Rviz2
+
+## Travmap Visualization Publish Rate (main_worldmodel.py, main_traversability_estimation.py)
+# CAUTION: keep ≥ 1.0 s to avoid overwhelming RViz.
+#          Has no effect unless pub_travmap_visualization is True.
+travmap_vis_pub_interval: 2.0  # (s) minimum seconds between /travmap_visualization publishes
 
 
 ####################### Planning Configurations #######################
 
+## Replanning trigger (WorldModel → /replanning_signal)
+# The planner replans immediately on each signal, so this gate — not a loop rate — is what
+# bounds replanning frequency. There is deliberately no minimum-interval floor: the gate is
+# evaluated once per main-loop tick, so worldmodel_rate_hz is the ceiling, and the planner
+# clears its request before solving so bursts coalesce instead of queuing.
+replan_min_changed_nodes: 12    # graph nodes whose payload actually changed since the last trigger.
+                                # One node per trav_estimation_resoultion cell (0.5 m) => 12 ≈ 3 m².
+                                # <= 0 disables the gate (every tick replans; a warning is printed).
+replan_cmd_change_eps: 0.05     # [m/s, rad/s] per-layer |Δcmd| that counts as a real change.
+                                # Below this, a rewrite with the same value counts as no change.
+replan_max_interval: 0.0        # [s] refresh even with no change; 0 = purely change-driven.
+
+
 ## Planning
-use_shared_memory: True
-# if True, planner reads maps from shared memory (multiprocess mode). 
-# If False, uses ROS topics (single process mode)
+# if True, planner reads maps from shared memory (multiprocess mode). If False, uses ROS topics (single process mode)
 # Start WorldModel first. PlanningNode attaches to shared memory that WorldModel creates — it will crash if that memory doesn't exist yet.
 
-
-
-# RRT*
-goal_radius_ratio: 0.05 # ratio of the goal radius to the environment extent
-
-switch_to_informed_from_thisiter: 480 # if 0, vanilla RRT is used
-iter_max: 500
-branch_length_max_ratio: 0.1
-search_radius_ratio: 0.8
-convergence_ratio: 0.00000001
-
-
-
-sampling_dist: 0.1  # m
-num_samplingpoints: None
-
-
-
-## MPC
-MPC_horizon: 7
-robust_horizon: 0
-
-ub_u_ddtheta: 0.03
-
-# waypoint
-getwaypoint_ratio: 1.2
+# Global-planner lookahead time (s) — always used by the global planner's replan() to reset the tree /
+# pick the next waypoint (main_global_planning.py).
+globalplanner_lookahead_time: 0.5
 
 
 # get_cmd_limit
+# Forward scan geometry of GlobalMap.get_cmd_limits(): the trav-map v/w limits handed to every
+# planner are averaged over samples taken every safecmd_sampling_dist metres, out to
+# lookahead_distance, along three rays (heading, heading ± lookahead_angle).
+# CAUTION: waypoint tracking uses waypoint_lookahead_distance instead. Enlarging this makes
+#          the speed limit react to terrain earlier but blurs it over a longer stretch of ground.
 lookahead_angle: 30 # deg
+lookahead_distance: 1.5  # (m) forward extent of the get_cmd_limits terrain scan
 safecmd_sampling_dist: 0.1
 
+
+# Global Planner Selection
+# Options: 'Astar' (GlobalAStar on the shared graph)
+global_planner_type: Astar
+
+# Graph A* (global_planner_type: Astar) — heading-aware sparse A* over the shared-memory graph.
+# Heading-layer geometry (theta_min/resolution/layers) is NOT duplicated here: it is read from the
+# world-model instance (the writer's authoritative source) and re-checked against the snapshot payloads.
+graph_astar_snapshot_max_retries: 50       # seqlock snapshot retry budget per plan (design 7.3)
+graph_astar_epsilon: 1.0e-12               # floating-point comparison epsilon for superseded heap entries
+# Heuristic options: euclidean | relaxed_dijkstra | reverse_dijkstra |
+#                    one_step_lookahead | heading_euclidean | alt |
+#                    weighted_euclidean | manhattan
+# heading_euclidean, Manhattan, and weighted_euclidean are experimental with the
+# current curvature-limited, 8-connected/irregular graph edge-cost model.
+graph_astar_heuristic: reverse_dijkstra
+graph_astar_heuristic_weight: 1.5           # used only by weighted_euclidean; must be >= 1
+graph_astar_alt_landmarks: 4                # number of spatially spread landmarks used by ALT
+# Path smoothing (look-ahead circle / pursuit-style corner cutting) — applied to the FINAL path of
+# the A* planner.
+# From the current point a circle of radius R is intersected with the remaining path; the path then
+# advances by d toward that look-ahead point, and the circle is drawn again. Corners are thus cut
+# before they are reached.
+# Every smoothed point is checked against the planning graph (active + non-isolated node); a rejected
+# cut falls back to the original on-graph path over that stretch, so smoothing can only lose quality,
+# never traversability.
+# CAUTION: path_smoothing_step must stay strictly below path_smoothing_radius (fails loud otherwise).
+#          Larger radius = harder corner cutting; keep it at or below waypoint_lookahead_distance
+#          (0.8 m) so the local planner does not cut an already-cut corner a second time.
+path_smoothing_enable: true
+path_smoothing_radius: 0.5   # (m) R: look-ahead circle radius
+path_smoothing_step:   0.25  # (m) d: advance per iteration = output waypoint spacing
+
+
+speed_discount: 0.8  # fraction of travmap v/w assumed achievable; inflates travel-time cost by 1/speed_discount
+
+# Arc approximation factor of the curvature-limited edge-cost model
+# (statenav_global/utility/utils.py: transition_cost). An edge of length L that turns the
+# heading by dtheta is treated as a constant-curvature arc of radius
+#     R = arc_radius_factor * L / dtheta,
+# on which the stored angular limit caps the traversal speed to min(v_h, w_i * R). So the
+# EFFECTIVE turn-rate the planner assumes is speed_discount * w_i * arc_radius_factor, and
+# the curvature branch only bites when L/dtheta < 1/arc_radius_factor: at 1.5 nothing below
+# a ~43 deg turn on a 0.5 m edge is penalised at all, at 0.85 anything above ~24 deg is.
+# CAUTION: this and speed_discount are ONE calibration pair — they scale the linear and the
+#          angular limit together, so changing either alone changes the turn penalty as a
+#          side effect.
+arc_radius_factor: 0.85
+
+
+####################### Waypoint / Debug #######################
 # debug
-debug_print: 0
-print_until_t: 5
-global_view: False
-local_view_radius: 3.4
+debug_print: True
 
-obs_clearance: 0.1  # m — geometric clearance margin for RRT edge collision checks
+# Fixed-distance waypoint lookahead (m) used by GlobalMap.get_waypoint.
+waypoint_lookahead_distance: 2.0
 
-#######################  Planner timing / lookahead ######################
 
-# Nominal control-loop period (s); used as reference dt in PurePursuitPlanner.__init__
-step_T: 0.45
-
-# Total lookahead time (s) passed to get_waypoint(); projected to a distance via current cmd_v_limit
-waypoint_lookahead_time: 1
-
-# Lookahead distance (m) used by the proportional controller in interaction mode to select a local target
-lookahead_distance: 1.5
-
+####################### Navigation FSM (statenav_fsm) #######################
+# Read by statenav_fsm/NavigationFSM.py and executables/main_fsm.py.
+radius_obs_affected_in_travmap: 0.2
+obstacle_interaction_distance_threshold: 0.5
+interaction_time_limit: 10.0
+fsm_transition_tag_duration: 1.0  # (s) how long FSMNode holds the WP_TRACKING_SUCCESS tag after success

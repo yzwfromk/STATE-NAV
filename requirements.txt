@@ -36,3 +36,7 @@ onnx>=1.17
 packaging
 wldhx.yadisk-direct
 gpustat>=1.1.1
+
+# -------- In-tree editable packages (installed via `pip install -e`, not from PyPI) --------
+# statenav_global      : this repo (root setup.py) — the global planner / world-model package.
+# statenav_fsm         : editable package at statenav_fsm/ — navigation FSM, QoS profiles, sim-time logger.

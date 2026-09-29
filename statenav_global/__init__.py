@@ -1,6 +1,9 @@
 __version__ = "0.0.1"
 
 # Import subpackages
+# NOTE: the FSM moved out to the standalone `statenav_fsm` package so that repos without
+# statenav_global (IsaacLab, elevation_mapping) can use it; import it directly:
+#     from statenav_fsm.NavigationFSM import NavigationFSM, FSMState
 from . import planners
 from . import world_model
 from . import utility

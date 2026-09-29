@@ -10,3 +10,4 @@ docker/.etc/
 statenav_global/mapping/lama
 .vscode/*
 .venv_statenav/
+output.png

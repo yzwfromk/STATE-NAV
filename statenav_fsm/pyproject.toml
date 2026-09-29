@@ -1,0 +1,22 @@
+[build-system]
+# setuptools >= 64 is what provides PEP 660 (the 'build_editable' hook) needed by
+# `pip install -e`. Environments whose build backend is older fall back to the legacy
+# `setup.py develop` path — see the setup.py shim next to this file.
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statenav_fsm"
+version = "0.1.0"
+description = "Portable STATE-NAV pieces shared across repos: the navigation FSM and the ROS2 QoS ladder."
+requires-python = ">=3.8"
+# Deliberately minimal so this package can be installed into every interpreter that
+# needs it (statenav venv, Isaac Sim's bundled python, the gsa and elevation_mapping
+# workspaces) without dragging torch / ROS message packages along.
+#   - omegaconf : used by NavigationFSM to read the planning config
+#   - rclpy     : used by qos_profiles, but NOT listed here — it ships with the ROS
+#                 distribution and is not installable from PyPI.
+dependencies = ["omegaconf"]
+
+[tool.setuptools.packages.find]
+include = ["statenav_fsm*"]

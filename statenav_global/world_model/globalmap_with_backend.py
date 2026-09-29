@@ -70,12 +70,18 @@ class CMDbasedMapWithBackend(CMDbasedMap):
     
     def _cleanup_handler(self):
         """Cleanup handler for atexit/ROS shutdown"""
+        # Close the shared graph first (owned by the writer-side map); harmless
+        # no-op when no graph was built (non-"Astar" planner types).
+        try:
+            self._close_shared_graph()
+        except Exception:
+            pass  # Ignore errors during shutdown
         if hasattr(self, 'backend') and self.use_shared_memory:
             try:
                 self.backend.cleanup()
             except Exception:
                 pass  # Ignore errors during shutdown
-    
+
     def Initilize_map(self):
         """
         Initialize maps using backend
@@ -86,6 +92,8 @@ class CMDbasedMapWithBackend(CMDbasedMap):
         if self.is_RobocentricMap_received:
             if not self.is_ElevationMap_built:
                 self.is_ElevationMap_built = True
+                if hasattr(self, 'backend'):
+                    self.backend.set_elev_map_built(True)
             
             # Calculate dimensions
             self.map_size_rows = int(self.map_size_x / self.map_resolution)
@@ -111,12 +119,19 @@ class CMDbasedMapWithBackend(CMDbasedMap):
             self.ElevMap_MetaInfo = self.backend.get_elev_meta_info()
             self.TravMap_MetaInfo = self.backend.get_trav_meta_info()
             
-            # Initialize with default values (same as original)
-            self.TraversabilityMap[:,:,:,0] = self.InitialGuess_cmd_v
-            self.TraversabilityMap[:,:,:,1] = self.InitialGuess_cmd_w
-            self.TraversabilityMap[:,:,:,2] = np.nan
-            self.TraversabilityMap[:,:,:,3] = np.nan
-            
+            # Initialize the neutral interior and the non-inferable too-risky border.
+            self._initialize_traversability_map_values()
+
+            # The initial fill IS map content, so the version leaves initialization at
+            # >= 1: a reader can then tell "map written" from the 0 of a fresh block.
+            self.bump_map_version()
+
+            # Build the lattice-aligned shared graph now that coarse-lattice
+            # geometry is known (writer side, only when global_planner_type ==
+            # "Astar"; a no-op otherwise). CMDbasedMap._build_shared_graph owns
+            # all graph logic and imports; this is only the construction hook.
+            self._build_shared_graph()
+
     
     def Update_map(self, path_plan=None, visualize_map=False):
         """
@@ -132,9 +147,10 @@ class CMDbasedMapWithBackend(CMDbasedMap):
             # Call parent's Update_map (all existing code works!)
             super().Update_map(path_plan, visualize_map)
             
-            # After updates, increment version
-            if self.use_shared_memory:
-                self.backend.increment_version()
+            # After updates, increment version. Not gated on use_shared_memory:
+            # LocalMemoryBackend carries the same counter, and every other map-write
+            # path bumps it unconditionally too (BaseMap.bump_map_version).
+            self.bump_map_version()
         
         finally:
             if self.use_shared_memory:
@@ -147,6 +163,8 @@ class CMDbasedMapWithBackend(CMDbasedMap):
     
     def cleanup(self):
         """Explicit cleanup (also called automatically on shutdown)"""
+        # Close the shared graph (no-op when none was built), then the backend.
+        self._close_shared_graph()
         if self.use_shared_memory:
             self.backend.cleanup()
 
@@ -232,7 +250,9 @@ class CMDbasedMapReaderProxy(CMDbasedMap):
         self.TravMap_MetaInfo_theta_resolution = self.TraversabilityMap_theta_resolution
         self.TravMap_MetaInfo_theta_max = self.TraversabilityMap_theta_max
         
-        # is_TraversabilityMap_built / is_ElevationMap_built are defined as properties below.
+        # is_TraversabilityMap_built / is_ElevationMap_built
+        # are defined as properties below — they always read live from the backend.
+        # No snapshot assignments here; the parent's __init__ writes are absorbed by no-op setters.
         self.is_ElevMap_MetaInfo_built = True  # MetaInfo arrays are available from shared memory
         self.is_TravMap_MetaInfo_built = True
     
@@ -256,6 +276,7 @@ class CMDbasedMapReaderProxy(CMDbasedMap):
     def is_ElevationMap_built(self, value):
         pass  # same as above
 
+    
     def _wait_and_initialize_backend(self, timeout: float = 120.0, check_interval: float = 0.1):
         """
         Wait for writer to initialize metadata AND create shared memory blocks, then initialize backend arrays.

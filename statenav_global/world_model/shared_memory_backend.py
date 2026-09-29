@@ -29,6 +29,18 @@ import sys
 # ---------------------------------------------------------------------------
 _META_SHM_NAME = 'statenav_meta_shm'
 
+# Signals whose default disposition kills the process WITHOUT unwinding the
+# interpreter, so atexit never runs and every named block would survive in
+# /dev/shm until the next writer start cleans it up. Writers install a cleanup
+# handler for all of them (SharedGraphWriter uses the same list):
+#   SIGINT  Ctrl+C            SIGTERM  kill / pkill / ros2 launch shutdown
+#   SIGHUP  terminal closed, ssh session dropped, nohup parent exit
+#   SIGQUIT Ctrl+\ (default would terminate with a core dump)
+# SIGKILL/SIGSTOP cannot be caught; SIGTSTP (Ctrl+Z) is deliberately left alone
+# because it suspends rather than terminates -- cleaning up there would destroy
+# maps the process is expected to keep serving after SIGCONT.
+_CLEANUP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
 _META_DTYPE = np.dtype([
     ('version',                np.int32),
     ('is_trav_map_built',      np.uint8),
@@ -39,11 +51,75 @@ _META_DTYPE = np.dtype([
     ('trav_map_rows',          np.int32),
     ('trav_map_cols',          np.int32),
     ('trav_map_layers',        np.int32),
-    ('elev_map_xmin',          np.float64),
-    ('elev_map_xmax',          np.float64),
-    ('elev_map_ymin',          np.float64),
-    ('elev_map_ymax',          np.float64),
+    ('elev_map_xmin',                  np.float64),
+    ('elev_map_xmax',                  np.float64),
+    ('elev_map_ymin',                  np.float64),
+    ('elev_map_ymax',                  np.float64),
 ], align=True)
+
+
+# ---------------------------------------------------------------------------
+# Reader-side resource-tracker helper
+# ---------------------------------------------------------------------------
+
+def _untrack_shm(shm) -> None:
+    """
+    Drop a reader-attached block from THIS process's resource tracker.
+
+    On POSIX, shared_memory.SharedMemory(name=...) registers the block with the
+    multiprocessing resource tracker even when it merely ATTACHES to a block
+    somebody else created (bpo-38119; SharedMemory(track=False) exists only on
+    Python >= 3.13). An independently launched reader therefore holds a tracker
+    entry for memory it does not own: when that reader exits first, its tracker
+    shm_unlink()s every writer-owned block. The writer keeps running fine on its
+    existing mapping, but the names disappear, so no reader can ever attach again
+    until the writer restarts. Unlinking is the writer's job alone, so readers
+    disown each block immediately after attaching.
+
+    Args:
+        shm: an attached shared_memory.SharedMemory instance (reader mode only —
+             never call this on a block this process created)
+    """
+    try:
+        # register() used the leading-slash form ('/name'); .name strips it.
+        resource_tracker.unregister(f'/{shm.name}', 'shared_memory')
+    except Exception as e:
+        # Non-fatal: an already-absent entry or an unreachable tracker both mean
+        # the block is untracked, which is exactly the state we want. Reported
+        # rather than swallowed because a real failure here means the reader may
+        # still unlink the writer's blocks at exit.
+        print(f"Warning: could not untrack shared memory '{shm.name}' "
+              f"({type(e).__name__}: {e}); this reader may unlink writer-owned "
+              f"blocks at exit")
+
+
+def _unlink_shm(shm) -> None:
+    """
+    Destroy a writer-owned block, keeping the resource tracker consistent.
+
+    SharedMemory.unlink() unconditionally sends an UNREGISTER to the tracker, and
+    the tracker raises KeyError when the name is not in its cache. That is exactly
+    the state a reader leaves behind whenever it shares this process's tracker:
+    children spawned by main_multiprocess.py inherit the parent's tracker fd, so
+    the reader's _untrack_shm() drops the entry the writer registered at creation.
+    Re-registering immediately before unlinking makes the pairing exact in both
+    deployments — the tracker keeps names in a set, so registering a name it
+    already holds is a no-op.
+
+    Args:
+        shm: a shared_memory.SharedMemory instance THIS process created (writer
+             mode only — readers must never unlink)
+    """
+    try:
+        resource_tracker.register(f'/{shm.name}', 'shared_memory')
+    except Exception as e:
+        # Reported, but never allowed to block the unlink below: a failed
+        # re-register only risks a benign KeyError print from the tracker,
+        # whereas skipping unlink() would leak the block until reboot.
+        print(f"Warning: could not re-register shared memory '{shm.name}' before "
+              f"unlink ({type(e).__name__}: {e}); a resource_tracker KeyError "
+              f"may follow")
+    shm.unlink()  # removes the name from the system AND unregisters it
 
 
 class _NoLock:
@@ -76,6 +152,9 @@ class SharedMemoryBackend:
         """
         self.mode = mode
         self._initialized = False
+        # Guards cleanup() against the multiple shutdown paths that reach it
+        # (signal handler, this backend's atexit hook, owning map's atexit hook)
+        self._closed = False
 
         # Shared memory blocks
         self.shm_blocks = {}
@@ -89,8 +168,15 @@ class SharedMemoryBackend:
         # Register cleanup handlers for crash recovery
         if mode == 'writer':
             atexit.register(self._cleanup_on_exit)
-            signal.signal(signal.SIGINT, self._signal_handler)
-            signal.signal(signal.SIGTERM, self._signal_handler)
+            for _sig in _CLEANUP_SIGNALS:
+                try:
+                    signal.signal(_sig, self._signal_handler)
+                except (ValueError, OSError) as e:
+                    # ValueError: not the main thread (atexit still covers normal
+                    # exit); OSError: signal not settable on this platform.
+                    print(f"Warning: could not install shared-memory cleanup handler "
+                          f"for {getattr(_sig, 'name', _sig)} ({type(e).__name__}: {e}); "
+                          f"that signal will leave stale blocks in /dev/shm")
             # Note: SIGKILL cannot be caught, but stale memory will be cleaned on next startup
         
     def _create_metadata(self):
@@ -125,6 +211,9 @@ class SharedMemoryBackend:
                     while True:
                         try:
                             self._shm = shared_memory.SharedMemory(name=_META_SHM_NAME)
+                            # Writer owns this block; disown the tracker entry
+                            # attaching just created (see _untrack_shm).
+                            _untrack_shm(self._shm)
                             break
                         except FileNotFoundError:
                             if time.time() - start > 10.0:
@@ -310,10 +399,16 @@ class SharedMemoryBackend:
         start_time = time.time()
         while time.time() - start_time < timeout:
             try:
-                self.shm_blocks['trav_map'] = shared_memory.SharedMemory(name='trav_map_shm')
-                self.shm_blocks['elev_map'] = shared_memory.SharedMemory(name='elev_map_shm')
-                self.shm_blocks['elev_meta'] = shared_memory.SharedMemory(name='elev_meta_shm')
-                self.shm_blocks['trav_meta'] = shared_memory.SharedMemory(name='trav_meta_shm')
+                # Attach block-by-block and disown each tracker entry immediately:
+                # if a later block is not created yet this loop retries, and any
+                # block attached by the failed attempt must not stay tracked.
+                for key, shm_name in (('trav_map',  'trav_map_shm'),
+                                      ('elev_map',  'elev_map_shm'),
+                                      ('elev_meta', 'elev_meta_shm'),
+                                      ('trav_meta', 'trav_meta_shm')):
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    _untrack_shm(shm)  # writer owns it; reader must never unlink
+                    self.shm_blocks[key] = shm
                 print("Attached to existing shared memory")
                 return
             except FileNotFoundError:
@@ -484,7 +579,12 @@ class SharedMemoryBackend:
     # ========================================================================
     
     def _signal_handler(self, signum, frame):
-        """Handle signals (SIGINT, SIGTERM) - automatic cleanup on crash"""
+        """Handle signals (_CLEANUP_SIGNALS) - automatic cleanup on crash
+
+        Exits 0 for every handled signal, matching the previous SIGINT/SIGTERM
+        behaviour; SIGHUP and SIGQUIT therefore no longer terminate the process
+        by default disposition (SIGQUIT stops producing a core dump).
+        """
         self.cleanup()
         sys.exit(0)
     
@@ -505,14 +605,25 @@ class SharedMemoryBackend:
         - Explicit call
         
         Note: SIGKILL cannot be caught, but stale memory is auto-cleaned on next startup
+
+        Idempotent: every call after the first returns immediately.
         """
+        # All three shutdown paths above can fire in the same shutdown, and the
+        # owning CMDbasedMapWithBackend registers a fourth (its own atexit hook),
+        # so without this guard cleanup() ran repeatedly per shutdown.
+        if self._closed:
+            return
+        self._closed = True
+
         for name, shm in self.shm_blocks.items():
             if shm:
                 try:
                     shm.close()
                     if self.mode == 'writer':
-                        shm.unlink()
-                        resource_tracker.unregister(f'/{shm.name}', 'shared_memory')
+                        # unlink() itself unregisters the block from the resource
+                        # tracker, so no explicit unregister may follow it: a second
+                        # UNREGISTER makes the tracker process raise KeyError.
+                        _unlink_shm(shm)
                 except Exception:
                     pass  # Ignore errors during cleanup
 
@@ -521,8 +632,7 @@ class SharedMemoryBackend:
             try:
                 self.metadata._shm.close()
                 if self.mode == 'writer':
-                    self.metadata._shm.unlink()
-                    resource_tracker.unregister(f'/{self.metadata._shm.name}', 'shared_memory')
+                    _unlink_shm(self.metadata._shm)  # also unregisters (see above)
             except Exception:
                 pass
 

@@ -32,7 +32,7 @@ def world_model_worker():
     try:
         # Create WorldModelNode with shared metadata
         # Note: ROS2 nodes always initialize via __init__, no init_ros parameter
-        world_model_node = WorldModelNode()
+        world_model_node = WorldModelNode(use_sim_time=True)
         world_model_node.get_logger().info(f"[WorldModel] WorldModel process started (PID: {mp.current_process().pid})")
 
         # Run world model node
@@ -54,7 +54,7 @@ def planner_worker():
     planning_node = None  # Initialize to handle creation failures
 
     try:
-        planning_node = PlanningNode()
+        planning_node = PlanningNode(use_sim_time=True)
         planning_node.get_logger().info(f"[Planner] Planner process started (PID: {mp.current_process().pid})")
 
         # Run planner node

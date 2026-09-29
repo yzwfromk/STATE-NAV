@@ -66,6 +66,8 @@ if [ ! -d "${STATENAV_SRC}" ]; then
 fi
 
 python3 -m pip install -e "${STATENAV_SRC}"
+# statenav_fsm (FSM, QoS profiles, sim-time logger) is a separate package imported by the nodes
+python3 -m pip install -e "${STATENAV_SRC}/statenav_fsm"
 
 echo -e "Building ROS2 workspace at ${STATENAV_WS}..."
 if ! command -v colcon >/dev/null 2>&1; then

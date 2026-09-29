@@ -6,9 +6,16 @@ import math
 import random
 import threading
 import matplotlib
-matplotlib.use('QtAgg')  # Use Qt backend
+# Headless 'Agg' backend by default, so merely importing this module never opens a pop-up
+# window and never requires a Qt binding (e.g. on the Jetson, or in the MPC venv which has
+# no Qt binding). NOTE: the previous 'QtAgg if DISPLAY else Agg' rule silently re-enabled
+# GUI windows in processes that had explicitly asked for 'Agg' — this module is imported
+# AFTER utility/plotting.py in the statenav_global package, and matplotlib.use() defaults to
+# force=True, so it overrode the earlier headless choice. An explicit MPLBACKEND or
+# STATENAV_MPL_BACKEND env var still wins (set either to 'QtAgg' for interactive debugging).
+if not os.environ.get('MPLBACKEND'):
+    matplotlib.use(os.environ.get('STATENAV_MPL_BACKEND', 'Agg'))
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 from enum import IntEnum
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -19,6 +26,16 @@ import torch
 
 from statenav_global.utility import Utils
 from statenav_global.utility.utils import get_source_inference_dir
+from statenav_global.utility.plotting import (
+    RC_PARAMS, FS_TICK, FS_LABEL, FS_LEGEND, FS_TITLE,
+    PLOT_DPI, PLOT_FORMAT, FONT_PROP, BaseFigure, MapFigure
+)
+# Shared-memory graph backend (Part 1a/1b). Only the writer-side symbols used by
+# the Part 2 grid-topology integration are imported here; the layout below is the
+# single definition writer and reader (planner) must both import.
+from statenav_global.world_model.shared_graph import (
+    GraphLayout, SharedGraphWriter, SharedGraphError,
+)
 
 
 
@@ -44,9 +61,6 @@ cfg = OmegaConf.load(_PKG_ROOT / "configs/planning_config.yaml")
 
 
     
-step_T = cfg.step_T
-MPC_horizon = cfg.MPC_horizon
-sampling_dist = cfg.sampling_dist
 lookahead_distance = cfg.lookahead_distance
 
 safecmd_sampling_dist = cfg.safecmd_sampling_dist
@@ -58,36 +72,6 @@ instability_std_multiplier = cfg.instability_std_multiplier
 
 
 
-# Check if Times New Roman font is available, fallback to default serif if not
-import os
-font_path = "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf"
-if os.path.exists(font_path):
-    times_new_roman = fm.FontProperties(fname=font_path)
-    use_times = True
-else:
-    # Rebuild font cache to ensure matplotlib doesn't try to use unavailable fonts
-    fm._load_fontmanager(try_read_cache=False)
-    times_new_roman = fm.FontProperties(family='serif')
-    use_times = False
-
-FS_TICK: int = 15
-FS_LABEL: int = 15
-FS_LEGEND: int = 15
-FS_TITLE: int = 20
-PLOT_DPI: int=1200
-PLOT_FORMAT: str='pdf'
-RC_PARAMS: dict = {
-    # Set background and border settings
-    'axes.facecolor': 'white',
-    'axes.edgecolor': 'black',
-    'axes.linewidth': 2,
-    'xtick.color': 'black',
-    'ytick.color': 'black',
-    "font.family": 'serif',
-    "font.serif": ["DejaVu Serif", "Liberation Serif", "Nimbus Roman"],  # Use available system fonts
-}
-savefigureonce_elevmap = cfg.savemap
-savefigureonce_travmap = cfg.savemap
 
 
 
@@ -111,6 +95,48 @@ class TravmapInfo_IntEnum(IntEnum):
     TRAV_NotInitialized = 0
     TRAV_NEEDUPDATE = 1
     TRAV_Estimated = 2
+
+
+# ---------------------------------------------------------------------------
+# Shared-memory graph payload layout (Part 2)
+# ---------------------------------------------------------------------------
+# One module-level layout imported identically by the writer (this world model)
+# and the reader (planner, Part 3). Do NOT reconstruct an equivalent dict at
+# other call sites.
+#
+# The fresh-node command defaults are bound to the exact values the existing
+# `Initilize_map` writes into TraversabilityMap on initialization
+# (TraversabilityMap[:,:,:,0] = InitialGuess_cmd_v, [:,:,:,1] = InitialGuess_cmd_w),
+# which are cfg.default_safe_cmd_v / cfg.default_safe_cmd_w. They are read from
+# the same config source rather than duplicated as literals, so a fresh graph
+# node's 8 cmd layers match the map's Initialguess state exactly. `meta` defaults
+# to TRAV_NotInitialized on every layer, matching the initial TravMap_MetaInfo.
+INITIAL_CMD_V_DEFAULT = float(cfg.default_safe_cmd_v)   # scalar broadcast over 8 heading layers
+INITIAL_CMD_W_DEFAULT = float(cfg.default_safe_cmd_w)   # scalar broadcast over 8 heading layers
+
+# Number of heading layers the graph payloads carry. The graph layout is a fixed
+# module constant, so it hard-codes the 8-layer heading discretization
+# (theta_min = -pi, theta_resolution = pi/4). _build_shared_graph guards that the
+# live map instance actually uses this many layers before constructing the graph.
+_GRAPH_HEADING_LAYERS = 8
+
+# Node payloads mirror TraversabilityMap cmd_v/cmd_w (float32, one value per
+# heading layer) and TravMap_MetaInfo (per-layer TravmapInfo_IntEnum status).
+# Edge payloads are empty: edges carry only generic graph-core data (immutable
+# geometric length); heading-aware traversal cost is derived planner-side in
+# Part 3, never stored on edges.
+GRAPH_LAYOUT = GraphLayout(
+    node_payloads={
+        "cmd_v": ((_GRAPH_HEADING_LAYERS,), np.float32, INITIAL_CMD_V_DEFAULT),
+        "cmd_w": ((_GRAPH_HEADING_LAYERS,), np.float32, INITIAL_CMD_W_DEFAULT),
+        "meta": (
+            (_GRAPH_HEADING_LAYERS,),
+            np.uint8,
+            int(TravmapInfo_IntEnum.TRAV_NotInitialized),
+        ),
+    },
+    edge_payloads={},
+)
 
 
 
@@ -181,14 +207,13 @@ class BaseMap:
 
         # ElevationMap update methods
         self.which_layer = which_layer
-        self.mean_over_maps = cfg.mean_over_maps # Boolean. If true, the first layer is used for data and the second layer is used for deciding if it is NaN
 
 
         # 3D (x,y,theta(=heading angle)) Traversability map that contains the pre-estimated cmd v and w. World frame
         self.is_TraversabilityMap_built = False
         self.TraversabilityMap = None
         self.TraversabilityMap_theta_min = -np.pi
-        self.TraversabilityMap_theta_resolution = np.pi/4
+        self.TraversabilityMap_theta_resolution = np.pi/4 # Do not change. 
         self.TraversabilityMap_theta_max = np.pi - self.TraversabilityMap_theta_resolution
         self.TraversabilityMap_size_layers = 2 * int(np.round(np.pi / self.TraversabilityMap_theta_resolution))
         print("Traversability Map size layers: ", self.TraversabilityMap_size_layers)
@@ -201,9 +226,6 @@ class BaseMap:
 
         self.InitialGuess_cmd_v = None
         self.InitialGuess_cmd_w = None
-
-        self.InitialGuess_auxiliary_score = None
-        self.InitialGuess_auxiliary_score_std = None
 
 
         self.maximum_cmd_v = cfg.maximum_cmd_v
@@ -219,6 +241,19 @@ class BaseMap:
         # TraversabilityMap update methods
         self.TravUpdate_XYResolution = preest_update_resolution
         self.TravUpdate_Pts = np.empty((0, 2))
+
+        # ── Replanning-gate change accounting ────────────────────────────────────────
+        # Accumulated map/graph change since the last published /replanning_signal.
+        # Reset ONLY by WorldModel.notify_replanning_published(), so sub-threshold change
+        # keeps accumulating across ticks instead of being discarded each tick.
+        #   graph_toorisky_flips      : nodes that entered or left the too-risky set (edges changed)
+        #   graph_nodes_value_changed : nodes whose cmd_v/cmd_w/meta payload actually changed value
+        self.map_change_stats = {
+            'graph_toorisky_flips': 0,
+            'graph_nodes_value_changed': 0,
+        }
+        # Per-layer |Δcmd| below which a rewrite is treated as "same value" (no change).
+        self._replan_cmd_change_eps = float(cfg.get('replan_cmd_change_eps', 0.05))
 
         self.elevation_diff_threshold = cfg.elevation_diff_threshold
         self.RandomRate_TravUpdate = cfg.RandomRate_TravUpdate
@@ -242,7 +277,7 @@ class BaseMap:
         # Visualization
         self.viz_channel = 0  # default channel
         self.viz_vmin = 0.0
-        self.viz_vmax = 0.5
+        self.viz_vmax = self.maximum_cmd_v
         self.viz_title = "Traversability Map"
         self.viz_cbar_label = "Traversability Score"
 
@@ -253,6 +288,9 @@ class BaseMap:
 
         # ML related
         self.device = 'cuda'
+
+
+
 
         # Travformer related
         self.local_patch_size = cfg.local_patch_size  # in meters
@@ -273,7 +311,7 @@ class BaseMap:
 
         if load_Travformer:
             inference_dir = get_source_inference_dir()
-            elevonly_vw2instab_model_checkpoint = os.path.join(inference_dir + "/checkpoints/Checkpoint_Example.pth")
+            elevonly_vw2instab_model_checkpoint = os.path.join(inference_dir + "/checkpoints/checkpoint_MLL_23.pth")
             self.elevonly_vw2instab_model = _load_model(elevonly_vw2instab_model_checkpoint, model_type='Travformer', device=self.device)
             print("Travformer model loaded.")
         else:
@@ -321,12 +359,58 @@ class BaseMap:
 
 
 
+    def _initialize_traversability_map_values(self):
+        """Initialize every traversability-map command with the neutral guess."""
+        if (self.TraversabilityMap is None or self.TraversabilityMap.ndim != 4
+                or self.TraversabilityMap.shape[3] != 4):
+            raise ValueError(
+                "_initialize_traversability_map_values requires TraversabilityMap "
+                f"shape (rows, cols, layers, 4), got "
+                f"{None if self.TraversabilityMap is None else self.TraversabilityMap.shape}")
+        expected_meta_shape = self.TraversabilityMap.shape[:3]
+        if self.TravMap_MetaInfo is None or self.TravMap_MetaInfo.shape != expected_meta_shape:
+            raise ValueError(
+                "_initialize_traversability_map_values requires TravMap_MetaInfo "
+                f"shape {expected_meta_shape}, got "
+                f"{None if self.TravMap_MetaInfo is None else self.TravMap_MetaInfo.shape}")
+
+        self.TraversabilityMap[:,:,:,0] = self.InitialGuess_cmd_v
+        self.TraversabilityMap[:,:,:,1] = self.InitialGuess_cmd_w
+        self.TraversabilityMap[:,:,:,2] = np.nan
+        self.TraversabilityMap[:,:,:,3] = np.nan
+        self.TravMap_MetaInfo[:] = TravmapInfo_IntEnum.TRAV_NotInitialized.value
 
 
 
 
 
 
+
+
+
+
+
+
+    def bump_map_version(self):
+        """
+        Publish "the dense map content changed" to the backend, ONCE per map-write
+        transaction.
+
+        The backend version counter is the only cross-process "map changed" signal
+        (SharedMemoryBackend.increment_version / LocalMemoryBackend.increment_version),
+        so EVERY path that mutates ElevationMap / TraversabilityMap / ElevMap_MetaInfo /
+        TravMap_MetaInfo must call this once it has finished writing.
+
+        One bump per Update_map / Initilize_map.
+
+        getattr guard: BaseMap also runs without any backend (plain CMDbasedMap in the
+        unit tests). The reader-mode guard keeps a reader proxy
+        (CMDbasedMapReaderProxy, which inherits every write method) from bumping the
+        writer's shared counter should it ever call one of them.
+        """
+        backend = getattr(self, 'backend', None)
+        if backend is not None and getattr(backend, 'mode', 'writer') != 'reader':
+            backend.increment_version()
 
 
     def Initilize_map(self):
@@ -345,14 +429,11 @@ class BaseMap:
         # Build global trav map  (flag not initialized here though)
         # 3D (x,y,theta(=heading angle)) global map that contains the pre-estimated cmd v and w array
             self.TraversabilityMap = np.full((self.map_size_rows, self.map_size_cols, self.TraversabilityMap_size_layers, 4), np.nan)
-            self.TraversabilityMap[:,:,:,0] = self.InitialGuess_cmd_v
-            self.TraversabilityMap[:,:,:,1] = self.InitialGuess_cmd_w
-            self.TraversabilityMap[:,:,:,2] = np.nan
-            self.TraversabilityMap[:,:,:,3] = np.nan
 
         # Build metainfo map
             self.ElevMap_MetaInfo = np.full((self.map_size_rows, self.map_size_cols), ElevmapInfo_IntEnum.ELEV_NotInitialized.value)
             self.TravMap_MetaInfo = np.full((self.map_size_rows, self.map_size_cols, self.TravMap_MetaInfo_size_layers), TravmapInfo_IntEnum.TRAV_NotInitialized.value)
+            self._initialize_traversability_map_values()
 
         
 
@@ -386,21 +467,8 @@ class BaseMap:
             # Update global map
             # rospy.loginfo("Available layers in self.layer_data: %s", list(layer_data_snap.keys()))
 
-            if len(self.which_layer) == 1:
-                local_map = layer_data_snap[self.which_layer[0]]
-                nan_map = local_map
-            else:
-
-                if self.mean_over_maps == True:
-                    local_map = np.mean([layer_data_snap[self.which_layer[i]] for i in range(len(self.which_layer))], axis=0)
-                    nan_map = layer_data_snap[self.which_layer[1]]
-                else:
-                    local_map = layer_data_snap[self.which_layer[0]]
-                    nan_map = layer_data_snap[self.which_layer[1]]
-                # the result will be NaN if one of the layers is NaN
-
-            # local_map  : (H, W) float  – robocentric elevation grid received this tick
-            # nan_map    : (H, W) float  – layer used to identify unobserved cells (NaN = no data)
+            # local_map : (H, W) float – robocentric elevation grid received this tick
+            local_map = layer_data_snap[self.which_layer[0]]
             H, W = local_map.shape
             # half_r / half_c: pixel offset from the local map's top-left corner to its center cell,
             # used to convert (row, col) indices into world-frame metric offsets
@@ -441,7 +509,7 @@ class BaseMap:
             # ---------------------------------------------------------------
 
             # valid : (H, W) bool – True for cells that have data and lie inside the global map
-            valid = (~np.isnan(nan_map)
+            valid = (~np.isnan(local_map)
                      & (row_global_all >= 0) & (row_global_all < self.map_size_rows)
                      & (col_global_all >= 0) & (col_global_all < self.map_size_cols))
 
@@ -484,7 +552,7 @@ class BaseMap:
 
             # elev_diff : (N,) float – |new elevation − stored elevation| per cell
             elev_diff = np.abs(local_vals - self.ElevationMap[vrg, vcg])
-            # case_b : (N,) bool – cells whose terrain changed significantly (and are not under reconstruction)
+            # case_b : (N,) bool – cells whose terrain changed significantly
             case_b = (~case_a
                       & (elev_diff > self.elevation_diff_threshold)
                       & (elev_meta <= ElevmapInfo_IntEnum.ELEV_MEASURED.value))
@@ -681,12 +749,20 @@ class BaseMap:
                 self.visualize_maps(theta_robot, path_plan)
 
 
-    def visualize_maps(self, map_theta, path_plan = None):
-        
 
-        theta_layer = int(np.round((map_theta-self.TraversabilityMap_theta_min)/self.TraversabilityMap_theta_resolution))
-        if theta_layer == self.TraversabilityMap_size_layers:
-            theta_layer = 0 # pi = -pi
+
+
+
+
+# TODO: Handle travmap
+# right size for trav update
+
+
+    def visualize_maps(self, map_theta, path_plan = None, save_dir = None):
+        # save_dir: when given, save the Elevation and Traversability figures as PDFs into
+        # this directory (used by the one-time experiment snapshot dump).
+
+        theta_layer = self.get_theta_layer(map_theta)
 
 
         path_plan = np.array(path_plan).reshape(-1,2) if path_plan is not None else None
@@ -699,98 +775,71 @@ class BaseMap:
 
 
         # ####################################### Elevation map #######################################
-        '''
-        This is the original code for visualizing the elevation map.
-        We don't need to visualize the elevation map in the globalmap.py file.
-
-        If you want to visualize the elevation map, you can uncomment the code below.
-        '''
         # Only visualize elevation map if it exists
-        # if self.ElevationMap is not None:
-        #     global savefigureonce_elevmap
-        #     if not hasattr(self, '_fig1') or not plt.fignum_exists(1):
-        #         self._fig1 = plt.figure(1)
-        #         manager = self._fig1.canvas.manager
-        #         manager.window.setGeometry(0, 0, 480, 420)  # Adjust the position and size as needed
-        #     else:
-        #         self._fig1.clf()
-        #     plt.figure(1)
-        #     plt.rcParams.update(RC_PARAMS)
-        #     plt.imshow(self.ElevationMap[:,:], cmap='viridis')
-        #     plt.title("Global Elevation Map", fontproperties=times_new_roman, fontsize=FS_TITLE)
-        #     if path_plan is not None and path_plan.shape[0] > 0:
-        #         plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], "Dr", markersize=3) 
-        #         plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], '-r', linewidth=1.5)
-        #         plt.plot(path_plan_InGridMap[0,1], path_plan_InGridMap[0,0], marker="D",color=(0,1,1), markersize=6)
-        #         plt.plot(path_plan_InGridMap[-1,1], path_plan_InGridMap[-1,0], marker="*",color=(1,1,0), markersize=10)
-            
-        #     cbar = plt.colorbar()
-        #     cbar.set_label('Height (m)', fontsize=FS_LEGEND, fontproperties=times_new_roman)  # Addi
-        #     plt.xlabel("Y-axis", fontsize=FS_LABEL, fontproperties=times_new_roman)
-        #     plt.ylabel("X-axis", fontsize=FS_LABEL, fontproperties=times_new_roman)
-        #     plt.xticks(np.linspace(0, self.ElevationMap.shape[1], int(self.map_ymax-self.map_ymin)+1), np.linspace(self.map_ymax, self.map_ymin, int(self.map_ymax-self.map_ymin+1) ))
-        #     plt.yticks(np.linspace(0, self.ElevationMap.shape[0], int(self.map_xmax-self.map_xmin)+1), np.linspace(self.map_xmax, self.map_xmin, int(self.map_xmax-self.map_xmin+1) ))
-        #     plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-        #     # plt.minorticks_on()
-        #     plt.tick_params(axis='both', which='major', labelsize=FS_TICK, width=2)
-        #     for label in plt.gca().get_xticklabels() + plt.gca().get_yticklabels():
-        #         label.set_fontproperties(times_new_roman)
-        #         label.set_fontsize(FS_TICK)
+        if self.ElevationMap is not None:
+            if not hasattr(self, '_mapfig_elev'):
+                self._mapfig_elev = MapFigure(1, (0, 0, 480, 420))
+            self._mapfig_elev.get_or_create()
+            plt.imshow(self.ElevationMap[:,:], cmap='viridis')
+            plt.title("Global Elevation Map", fontproperties=FONT_PROP, fontsize=FS_TITLE)
+            if path_plan is not None and path_plan.shape[0] > 0:
+                plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], "Dr", markersize=3)
+                plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], '-r', linewidth=1.5)
+                plt.plot(path_plan_InGridMap[0,1], path_plan_InGridMap[0,0], marker="D",color=(0,1,1), markersize=6)
+                plt.plot(path_plan_InGridMap[-1,1], path_plan_InGridMap[-1,0], marker="*",color=(1,1,0), markersize=10)
 
-        #     if savefigureonce_elevmap and path_plan is not None and path_plan.shape[0] > 0:
-        #         figure_path = os.path.join(Path(__file__).parents[1], "./")
-        #         os.makedirs(figure_path, exist_ok=True)
-        #         plt.savefig(figure_path + 'World Elevation Map' + '.pdf', format=PLOT_FORMAT, dpi=PLOT_DPI, bbox_inches='tight')
-        #         savefigureonce_elevmap = False
-        #     plt.show(block=False)
-        #     plt.pause(0.001)      
+            self._mapfig_elev.apply_colorbar('Height (m)')
+            self._mapfig_elev.apply_axes_style(
+                self.ElevationMap.shape[:2],
+                (self.map_xmin, self.map_xmax),
+                (self.map_ymin, self.map_ymax)
+            )
+            # plt.minorticks_on()
+            # One-time experiment snapshot: save the elevation figure into the log dir.
+            if save_dir is not None:
+                os.makedirs(save_dir, exist_ok=True)
+                plt.savefig(os.path.join(save_dir, 'World Elevation Map' + '.pdf'), format=PLOT_FORMAT, dpi=PLOT_DPI, bbox_inches='tight')
+            else:
+                # Interactive use only: pop up the window. Skipped in headless snapshot mode
+                # (save_dir given) so the one-time experiment dump never opens GUI windows.
+                self._mapfig_elev.show()
+
+
+
+
 
 
         ####################################### Traversability map #######################################
-        global savefigureonce_travmap
-        if not hasattr(self, '_fig1') or not plt.fignum_exists(1):
-            self._fig1 = plt.figure(1)
-            manager = self._fig1.canvas.manager
-            manager.window.setGeometry(0, 0, 480, 420)  # Adjust the position and size as needed
-        else:
-            self._fig1.clf()
-        plt.figure(1)
-        plt.rcParams.update(RC_PARAMS)
-
+        if not hasattr(self, '_mapfig_trav'):
+            self._mapfig_trav = MapFigure(2, (0, 660, 480, 420))
+        self._mapfig_trav.get_or_create()
 
         plt.imshow(self.TraversabilityMap[:,:,theta_layer,self.viz_channel], cmap='coolwarm_r', vmin=self.viz_vmin, vmax=self.viz_vmax)
-        plt.title(f"Traversability Map", fontproperties=times_new_roman, fontsize=FS_TITLE)
-        cbar = plt.colorbar()
-        cbar.set_label(self.viz_cbar_label, fontproperties=times_new_roman, fontsize=FS_LEGEND)  #
-        
+        plt.title(f"Traversability Map", fontproperties=FONT_PROP, fontsize=FS_TITLE)
+        self._mapfig_trav.apply_colorbar(self.viz_cbar_label)
 
         if path_plan is not None and path_plan.shape[0] > 0:
-            # plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], "Dr", markersize=3) 
+            # plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], "Dr", markersize=3)
             plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], '--', color='lime', linewidth=4, label = 'Global Path Plan')
             # plt.plot(path_plan_InGridMap[0,1], path_plan_InGridMap[0,0], marker="D",color=(0,1,1), markersize=6)
             # plt.plot(path_plan_InGridMap[-1,1], path_plan_InGridMap[-1,0], marker="*",color=(1,1,0), markersize=10)
             pass
 
-        plt.xlabel("Y-axis", fontproperties=times_new_roman, fontsize=FS_LABEL)
-        plt.ylabel("X-axis", fontproperties=times_new_roman, fontsize=FS_LABEL)
-        plt.xticks(np.linspace(0, self.TraversabilityMap.shape[1], int(self.map_ymax-self.map_ymin+1)), np.linspace(self.map_ymax, self.map_ymin, int(self.map_ymax-self.map_ymin+1)))
-        plt.yticks(np.linspace(0, self.TraversabilityMap.shape[0], int(self.map_xmax-self.map_xmin+1)), np.linspace(self.map_xmax, self.map_xmin, int(self.map_xmax-self.map_xmin+1)))
-        plt.grid(True)
-        plt.tick_params(axis='both', which='major', labelsize=FS_TICK, width=2)
-        for label in plt.gca().get_xticklabels() + plt.gca().get_yticklabels():
-            label.set_fontproperties(times_new_roman)
-            label.set_fontsize(FS_TICK)
-        legend = plt.legend(loc='upper left', prop=times_new_roman, fontsize=FS_LEGEND)
-        for text in legend.get_texts():
-            text.set_fontsize(FS_LEGEND)  # 🔹 Force larger size
-
-        if savefigureonce_travmap and path_plan is not None and path_plan.shape[0] > 0:
-            figure_path = os.path.join(Path(__file__).parents[1], "./")
-            os.makedirs(figure_path, exist_ok=True)
-            plt.savefig(figure_path + 'Traversability Map' + '.pdf', format=PLOT_FORMAT, dpi=PLOT_DPI, bbox_inches='tight')
-            savefigureonce_travmap = False
-        plt.show(block=False)
-        plt.pause(0.001)
+        self._mapfig_trav.apply_axes_style(
+            self.TraversabilityMap.shape[:2],
+            (self.map_xmin, self.map_xmax),
+            (self.map_ymin, self.map_ymax),
+            grid_kwargs={}
+        )
+        self._mapfig_trav.apply_legend(loc='upper left')
+        # One-time experiment snapshot: save the traversability figure into the log dir.
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            plt.savefig(os.path.join(save_dir, 'Traversability Map' + '.pdf'), format=PLOT_FORMAT, dpi=PLOT_DPI, bbox_inches='tight')
+        else:
+            # Interactive use only: pop up the window. Skipped in headless snapshot mode
+            # (save_dir given) so the one-time experiment dump never opens GUI windows.
+            self._mapfig_trav.show()
 
 
     def get_travmap(self, estimating_xypts_set, xmin, xmax, ymin, ymax):
@@ -987,10 +1036,9 @@ class BaseMap:
 
 
     def get_theta_layer(self, theta):
-        theta_layer = int(np.round((theta-self.TraversabilityMap_theta_min)/self.TraversabilityMap_theta_resolution))
-        if theta_layer == self.TraversabilityMap_size_layers:
-            theta_layer = 0 # pi = -pi
-        return theta_layer
+        return Utils.heading_to_layer(theta, self.TraversabilityMap_theta_min,
+                                      self.TraversabilityMap_theta_resolution,
+                                      self.TraversabilityMap_size_layers)
 
     def xy2grid(self, x, y):
         
@@ -1050,9 +1098,7 @@ class BaseMap:
                 col = int( (self.map_ymax - y)/self.map_resolution )
                 
 
-                theta_layer = int(np.round((theta-self.TraversabilityMap_theta_min)/self.TraversabilityMap_theta_resolution))
-                if theta_layer == self.TraversabilityMap_size_layers:
-                    theta_layer = 0 # pi = -pi
+                theta_layer = self.get_theta_layer(theta)
 
                 if row < 0 or row >= self.map_size_rows or col < 0 or col >= self.map_size_cols:
                     continue
@@ -1078,18 +1124,12 @@ class BaseMap:
     def get_waypoint(self, robot_x, robot_y, robot_heading, total_lookahead_time, cmd_v_limit, cmd_w_limit, path):
         """
         This function takes in the current position of the robot and returns the next waypoint (in the global coordinate system)
-        that the robot should move to. The waypoint is selected from the global path such that the robot is expected to reach
-        the waypoint within total_lookahead_time seconds.
+        that the robot should move to. The waypoint is a point on the global path at exactly reachable_radius distance from
+        the robot, where reachable_radius = total_lookahead_time * cmd_v_limit.
 
-        The function first finds the node in the global path that is nearest to the robot. It then iterates through the path
-        from this node and finds the node that the robot is expected to reach within the given total time. The function then
-        returns the coordinates of this node as the next waypoint.
-
-        If the robot is close to the end of the path, the function will return the last node in the path as the next waypoint.
-        If the robot is close to a node in the path, the function will return the next node in the path as the next waypoint.
-
-        The function also takes into account the elevation map and the current orientation of the robot. The function will
-        return a waypoint that is reachable by the robot given the elevation map and the current orientation of the robot.
+        The function finds the path node nearest to the robot, advances past any nodes that are behind the robot, then
+        interpolates to the exact point where the path crosses the reachable_radius circle. If the remaining path is shorter
+        than reachable_radius, the last path node (clamped to reachable_radius) is returned.
 
         Parameters
         ----------
@@ -1098,106 +1138,122 @@ class BaseMap:
         robot_y : float
             The current y-coordinate of the robot in the global coordinate system.
         robot_heading : float
-            The current heading of the robot in radians.
+            The current heading of the robot in radians (reserved for future use).
         total_lookahead_time : float
-            Total lookahead time in seconds (= waypoint_lookahead_time from config).
+            Total lookahead time in seconds. The local planner (main.py::_select_waypoint) pins
+            cmd_v_limit/cmd_w_limit to 1.0 and passes cfg.waypoint_lookahead_distance here, so
+            reachable_radius below collapses to that fixed distance in metres.
         cmd_v_limit : float
             Maximum linear velocity limit.
         cmd_w_limit : float
-            Maximum angular velocity limit.
+            Maximum angular velocity limit (reserved for future use).
         path : array_like
             The global path as a numpy array of shape (N, 2) where each row is [x, y].
 
         Returns
         -------
-        global_waypoint : array_like or False
-            The coordinates of the next waypoint in the global coordinate system, or False if no path is available.
+        waypoint : array_like or False
+            The coordinates of the next waypoint in the global coordinate system, or False if no path is available
+            or the traversability map is not yet built.
         """
-        path = np.array(path)
-        global_waypoint = False
-        total_time = total_lookahead_time
+        path = np.array(path)  # (N, 2) array of [x, y] path nodes in global frame
         if path.shape[0] == 0:
             print(' Getting Waypoint: No path received')
             return False
-        
+
+        # Clamp velocity limits to sensible minimums to avoid zero-radius degenerate cases
         cmd_v_limit = max(cmd_v_limit, 0.1)
-        cmd_w_limit = max(cmd_w_limit, 0.06)
+        # reachable_radius: how far (meters) the robot can travel within total_lookahead_time at cmd_v_limit
+        reachable_radius = total_lookahead_time * cmd_v_limit
 
-        # find a node that the agent can reach within the total time
-        node_index_nearest_from_robot = int(np.argmin([math.hypot(path[nd,0] - robot_x, path[nd,1] - robot_y)
+        def _waypoint_at_radius(target_node):
+            # Interpolate from robot toward target_node, clamped to reachable_radius.
+            # Returns a point at reachable_radius distance if target is beyond it; otherwise returns target itself.
+            robot_pos = np.array([robot_x, robot_y])
+            dist = math.hypot(float(target_node[0]) - robot_x, float(target_node[1]) - robot_y)
+            if dist > reachable_radius:
+                return robot_pos + (target_node - robot_pos) * (reachable_radius / dist)
+            return target_node
+
+        # --- Step 1: Find the path node closest to the robot ---
+        # waypoint_node_index: index of the path node with minimum Euclidean distance to the robot; used as the starting search point
+        waypoint_node_index = int(np.argmin([math.hypot(path[nd,0] - robot_x, path[nd,1] - robot_y)
                                         for nd in range(path.shape[0])]))
-        waypoint_node_index = node_index_nearest_from_robot
-        robot_to_wp_angle = np.arctan2( (path[waypoint_node_index,1]-robot_y), (path[waypoint_node_index,0]-robot_x)  )
-        robot_to_goal_angle = np.arctan2( (path[-1,1]-robot_y), (path[-1,0]-robot_x)  )
-        robot_to_goal_distance = math.hypot(path[-1,0] - robot_x, path[-1,1] - robot_y)
-        reachable_radius = total_time * cmd_v_limit
 
+        # If the nearest node is already the last node, aim toward the goal clamped to reachable_radius
         if waypoint_node_index >= path.shape[0] - 1:
-            print(' Getting Waypoint: Getting the end of the path')
-            return path[-1,:]
+            # Interpolate toward path[-1] at exactly reachable_radius instead of
+            # teleporting to it, so the waypoint stays at a constant lookahead distance.
+            return _waypoint_at_radius(path[-1, :])
 
-        # Find an intermediate goal that is distant by 2 * reachable_radius from the robot
+        # --- Step 2: Find an intermediate goal node to determine the forward direction ---
+        # intermediate_goal_radius: twice the reachable radius, used to identify a node clearly ahead of the robot
         min_cmd = max(cmd_v_limit, 0.25)
-        intermediate_goal_radius = 2 * total_time * min_cmd
+        intermediate_goal_radius = 2 * total_lookahead_time * min_cmd
         intermediate_goal_node_index = waypoint_node_index
         for node_idx in range(waypoint_node_index,path.shape[0]):
             if math.hypot(path[node_idx,0] - robot_x, path[node_idx,1] - robot_y) >= intermediate_goal_radius:
                 intermediate_goal_node_index = node_idx
                 break
+        # robot_to_intermediate_goal_distance: distance from robot to the chosen intermediate goal node
         robot_to_intermediate_goal_distance = math.hypot(path[intermediate_goal_node_index,0] - robot_x, path[intermediate_goal_node_index,1] - robot_y)
-        
-        set_this_node_as_waypoint = False
-        while set_this_node_as_waypoint == False:
 
+        # --- Step 3: Advance waypoint_node_index past nodes that are "behind" the robot ---
+        # A node is considered behind the robot if it is farther from the intermediate goal than the robot itself is.
+        # This handles the case where the nearest node is behind the robot's current position along the path.
+        while waypoint_node_index < path.shape[0] - 1:
+
+            # wp_to_intermediate_goal_distance: distance from candidate waypoint node to the intermediate goal
             wp_to_intermediate_goal_distance = math.hypot(path[waypoint_node_index,0] - path[intermediate_goal_node_index,0], path[waypoint_node_index,1] - path[intermediate_goal_node_index,1])
-
-            if waypoint_node_index >= path.shape[0] - 1:
-                print(' Getting Waypoint: Getting the end of the path')
-                return path[-1,:]
 
             if wp_to_intermediate_goal_distance > robot_to_intermediate_goal_distance:
                 # This waypoint is behind the robot. Proceed to the next node
-                waypoint_node_index = waypoint_node_index + 1
-                robot_to_wp_angle = np.arctan2( (path[waypoint_node_index,1]-robot_y), (path[waypoint_node_index,0]-robot_x)  )
+                waypoint_node_index += 1
 
             else:
-                set_this_node_as_waypoint = True
+                break
 
+        # If advancing pushed us to the last node, aim toward the end of the path
         if waypoint_node_index >= path.shape[0] - 1:
             print(' Getting Waypoint: Getting the end of the path')
-            return path[-1,:]
+            return _waypoint_at_radius(path[-1, :])
 
+        # --- Step 4: Find the exact waypoint on the reachable_radius boundary ---
+        # Only executed when the traversability map is available; returns False otherwise (map not yet ready).
         if self.is_TraversabilityMap_built:
-            
-            # Starting from the initial waypoint, find a point that the robot can reach within the total time
+
+            # Scan forward from waypoint_node_index to find the first node that exceeds reachable_radius
             for node in range(waypoint_node_index, path.shape[0]):
 
                 robot_to_this_node_distance = math.hypot(path[node,0] - robot_x, path[node,1] - robot_y)
                 if robot_to_this_node_distance > reachable_radius: # we got to a node that is further than the reachable radius
 
                     if node == waypoint_node_index: # the nearest hopeful node is already further than the reachable radius
-                        global_waypoint = np.array([robot_x, robot_y]) + (path[node,:] - np.array([robot_x, robot_y])) * (reachable_radius)/robot_to_this_node_distance
-                        return global_waypoint
-
-                    if node == path.shape[0] - 1:
-                        global_waypoint = path[-1,:]
-                        return global_waypoint
+                        return _waypoint_at_radius(path[node, :])
 
                     # This means that the found node is not the nearest hopeful node.
                     # We need to get intermediate point between this found node and its previous node
                     previous_node = node - 1
                     robot_to_previous_node_distance = math.hypot(path[previous_node,0] - robot_x, path[previous_node,1] - robot_y)
                     if robot_to_previous_node_distance > reachable_radius:
-                        print(f'[DEBUG INFO] The previous node: {path[previous_node,:]} with distance {robot_to_previous_node_distance} is further than the reachable radius: {reachable_radius}')
-                        print(f'[DEBUG INFO] The found node: {path[node,:]} with distance {robot_to_this_node_distance} is further than the reachable radius: {reachable_radius}')
-                        print('But it is not the nearest hopeful node')
-                        raise ValueError('This should not happen')
+                        raise ValueError(
+                            f'[DEBUG INFO] The previous node: {path[previous_node,:]} with distance {robot_to_previous_node_distance}'
+                            f' is further than the reachable radius: {reachable_radius}; '
+                            f'The found node: {path[node,:]} with distance {robot_to_this_node_distance}'
+                            f' is further than the reachable radius: {reachable_radius}; '
+                            f'But it is not the nearest hopeful node. This should not happen.'
+                        )
                     else: # robot_to_previous_node_distance < reachable_radius
-                        global_waypoint = path[previous_node,:] + (path[node,:] - path[previous_node,:]) * (reachable_radius - robot_to_previous_node_distance)/(robot_to_this_node_distance - robot_to_previous_node_distance)
+                        # Interpolate to the exact reachable_radius boundary between previous and current node
+                        # alpha: fractional position along the segment [previous_node, node] where the boundary is crossed
+                        alpha = (reachable_radius - robot_to_previous_node_distance) / (robot_to_this_node_distance - robot_to_previous_node_distance)
                         # This is not exactly accurate equation but good approximation
-                        return global_waypoint
+                        return path[previous_node,:] + (path[node,:] - path[previous_node,:]) * alpha
 
-        return global_waypoint
+            # All remaining nodes are within reachable_radius; aim at the final node clamped to reachable_radius
+            return _waypoint_at_radius(path[-1, :])
+
+        return False
 
     
     def pose_callback(self, msg: PoseStamped):
@@ -1297,9 +1353,6 @@ class CMDbasedMap(BaseMap):
         self.InitialGuess_cmd_v = cfg.default_safe_cmd_v
         self.InitialGuess_cmd_w = cfg.default_safe_cmd_w
 
-        self.InitialGuess_auxiliary_score = np.nan
-        self.InitialGuess_auxiliary_score_std = np.nan
-
 
         # trav as velcity-based method specific
         self.toorisky_v = cfg.toorisky_v
@@ -1315,14 +1368,444 @@ class CMDbasedMap(BaseMap):
             )
 
         self.instability_limit = instab_limit # = \delta_limit
-        self.interp_sigmoid_k = 14.0  # sharpness of S-curve interpolation between quadrant corners
+        self.interp_sigmoid_k = cfg.interp_sigmoid_k  # sharpness of S-curve interpolation between quadrant corners (from planning_config.yaml)
 
         # Visualization
         self.viz_channel = 0  # default channel
         self.viz_vmin = 0.0
-        self.viz_vmax = 2.0
+        self.viz_vmax = self.maximum_cmd_v
         self.viz_title = "Traversability Map"
         self.viz_cbar_label = "Linear Velocity (m/s)"
+
+        # ── Shared-memory graph (Part 2) ─────────────────────────────────────
+        # Owned only by the writer-side map when global_planner_type == "Astar";
+        # created lazily by _build_shared_graph() once the coarse lattice geometry
+        # is known. Left None everywhere else (base map, reader proxy, other
+        # planner types), which disables every graph hook below.
+        self.graph_writer = None
+        # Retained coarse estimation-lattice CENTER bounds (kx_min*R ... kx_max*R),
+        # the expected-update domain used to classify write-back points. Distinct
+        # from create_grid's half-cell-extended storage bounds. Set in
+        # _build_shared_graph().
+        self._graph_lattice_bounds = None      # (lxmin, lxmax, lymin, lymax)
+        # float32-roundoff tolerance for stored-coordinate equality checks; set
+        # from the actual snapped bounds in _build_shared_graph().
+        self._graph_coord_tol = None
+
+
+    def _initialize_traversability_map_values(self):
+        """Initialize neutral commands, then mark the non-inferable map border too-risky."""
+        super()._initialize_traversability_map_values()
+
+        if (self.map_resolution is None or not np.isfinite(self.map_resolution)
+                or self.map_resolution <= 0.0):
+            raise ValueError(
+                "_initialize_traversability_map_values requires a finite positive "
+                f"map_resolution, got {self.map_resolution}")
+        if not np.isfinite(self.local_patch_size) or self.local_patch_size <= 0.0:
+            raise ValueError(
+                "_initialize_traversability_map_values requires a finite positive "
+                f"local_patch_size, got {self.local_patch_size}")
+
+        # half_patch_cells is the half-side of each TravFormer elevation input in
+        # fine-map cells. Border cells closer than this cannot provide a complete
+        # patch, so every heading layer starts at the exact too-risky sentinel.
+        half_patch_cells = int(np.round(0.5 * self.local_patch_size / self.map_resolution))
+        if half_patch_cells <= 0:
+            return
+
+        rows, cols = self.TraversabilityMap.shape[:2]
+        row_indices = np.arange(rows)[:, None]  # (rows, 1) fine-map row index
+        col_indices = np.arange(cols)[None, :]  # (1, cols) fine-map column index
+        boundary_mask = ((row_indices < half_patch_cells)
+                         | (row_indices >= rows - half_patch_cells)
+                         | (col_indices < half_patch_cells)
+                         | (col_indices >= cols - half_patch_cells))  # (rows, cols)
+        self.TraversabilityMap[:, :, :, 0][boundary_mask] = self.toorisky_v
+        self.TraversabilityMap[:, :, :, 1][boundary_mask] = self.toorisky_w
+        self.TravMap_MetaInfo[boundary_mask] = TravmapInfo_IntEnum.TRAV_Estimated.value
+
+
+    # =====================================================================
+    # Shared-memory graph integration (Part 2) — one contiguous region.
+    #
+    # Responsibilities, all writer-side and all no-ops when self.graph_writer
+    # is None (base map, reader proxy, or global_planner_type != "Astar"):
+    #   _build_shared_graph()        : lattice-aligned graph construction
+    #   _close_shared_graph()        : shutdown cleanup
+    #   _graph_layer_too_risky_mask()/_graph_node_has_too_risky() : the single
+    #                                  too-risky predicate (shared with tests)
+    #   _apply_graph_update()        : mirror one map-update's coarse-lattice
+    #                                  cmd_v/cmd_w/meta into node payloads and
+    #                                  maintain the aggregate too-risky topology
+    #
+    # The graph is a MIRROR of the existing TraversabilityMap / TravMap_MetaInfo
+    # coarse-lattice state, not a second estimator: the capture site (Step 9)
+    # carries the exact cmd_v/cmd_w/meta it writes to
+    # the dense grid into the record (direct write, no read-back), and
+    # _apply_graph_update never recomputes values or heading-layer selection.
+    # =====================================================================
+
+    def _build_shared_graph(self):
+        """
+        Construct the lattice-aligned shared graph exactly once, when
+        global_planner_type == "Astar". No-op for every other planner type
+        (leaves self.graph_writer = None) and if already built.
+
+        Node centers land on the estimation lattice (world multiples of
+        TravUpdate_XYResolution clipped to the map bounds) via create_grid's
+        cell-edge bounds, so runtime write-back points resolve by coordinate.
+        No grid-index-to-slot logic is created or retained.
+        """
+        # Idempotent: build at most once.
+        if self.graph_writer is not None:
+            return
+        # Existing planner selector gates construction (no graph-specific flag).
+        if str(cfg.get('global_planner_type', 'Astar')) != "Astar":
+            return
+        # Geometry must be known (Initilize_map has run and set map bounds/res).
+        if self.map_resolution is None or not self.is_ElevationMap_built:
+            raise SharedGraphError(
+                "_build_shared_graph called before map geometry is known "
+                f"(map_resolution={self.map_resolution}, "
+                f"is_ElevationMap_built={self.is_ElevationMap_built})")
+        # The module-level GRAPH_LAYOUT hard-codes _GRAPH_HEADING_LAYERS heading
+        # layers; refuse to build if the live map uses a different count.
+        if int(self.TraversabilityMap_size_layers) != _GRAPH_HEADING_LAYERS:
+            raise SharedGraphError(
+                f"_build_shared_graph: map has {self.TraversabilityMap_size_layers} "
+                f"heading layers but GRAPH_LAYOUT is fixed at {_GRAPH_HEADING_LAYERS}; "
+                f"update GRAPH_LAYOUT before enabling the graph")
+
+        R = float(self.TravUpdate_XYResolution)   # coarse estimation-lattice resolution (m)
+        if not (R > 0.0):
+            raise SharedGraphError(f"_build_shared_graph: non-positive resolution R={R}")
+
+        # ---- retained integer lattice index range within the map bounds -----
+        # Lattice points are world multiples of R; the extreme multiples that
+        # fall inside [map_xmin, map_xmax] x [map_ymin, map_ymax] define the
+        # lattice. round-then-clip removes float noise near an exact multiple.
+        def _k_min(lo):
+            # smallest integer k with k*R >= lo; the -1e-9 nudge keeps an lo that
+            # is already an exact multiple of R from rounding up a spurious cell.
+            return math.ceil(lo / R - 1e-9)
+
+        def _k_max(hi):
+            # largest integer k with k*R <= hi (symmetric +1e-9 nudge).
+            return math.floor(hi / R + 1e-9)
+
+        kx_min = _k_min(self.map_xmin)
+        kx_max = _k_max(self.map_xmax)
+        ky_min = _k_min(self.map_ymin)
+        ky_max = _k_max(self.map_ymax)
+        rows_expected = kx_max - kx_min + 1        # number of distinct x lattice points
+        cols_expected = ky_max - ky_min + 1        # number of distinct y lattice points
+        if rows_expected < 1 or cols_expected < 1:
+            raise SharedGraphError(
+                f"_build_shared_graph: empty lattice (rows={rows_expected}, "
+                f"cols={cols_expected}) for map x[{self.map_xmin}, {self.map_xmax}] "
+                f"y[{self.map_ymin}, {self.map_ymax}] at R={R}")
+
+        lattice_xmin = kx_min * R
+        lattice_xmax = kx_max * R
+        lattice_ymin = ky_min * R
+        lattice_ymax = ky_max * R
+        # create_grid is cell-centered; extend bounds by half a cell so generated
+        # cell centers land exactly on the lattice extrema (see plan §"touchpoints").
+        snapped_xmin = lattice_xmin - R / 2.0
+        snapped_xmax = lattice_xmax + R / 2.0
+        snapped_ymin = lattice_ymin - R / 2.0
+        snapped_ymax = lattice_ymax + R / 2.0
+
+        # Guard: the snapped cell-edge bounds must reproduce EXACTLY the expected
+        # counts under create_grid's ceil(extent / resolution) rule; a float-noise
+        # extra row/col would silently break coordinate resolution later.
+        rows_grid = max(1, int(math.ceil((snapped_xmax - snapped_xmin) / R)))
+        cols_grid = max(1, int(math.ceil((snapped_ymax - snapped_ymin) / R)))
+        if rows_grid != rows_expected or cols_grid != cols_expected:
+            raise SharedGraphError(
+                f"_build_shared_graph: snapped-bounds grid ({rows_grid}x{cols_grid}) "
+                f"does not match the retained lattice index range "
+                f"({rows_expected}x{cols_expected}); geometry/config mismatch "
+                f"(R={R}, x[{self.map_xmin}, {self.map_xmax}] "
+                f"y[{self.map_ymin}, {self.map_ymax}])")
+
+        # float32-roundoff tolerance for stored-coordinate equality (node coords
+        # are float32). Scaled by the largest coordinate magnitude in play.
+        max_abs = max(abs(snapped_xmin), abs(snapped_xmax),
+                      abs(snapped_ymin), abs(snapped_ymax), 1.0)
+        coord_tol = 8.0 * float(np.finfo(np.float32).eps) * max_abs
+
+        # ---- construct (n_max/e_max/bucket_size auto-sized by create_grid) ---
+        writer = SharedGraphWriter.create_grid(
+            xmin=snapped_xmin,
+            xmax=snapped_xmax,
+            ymin=snapped_ymin,
+            ymax=snapped_ymax,
+            resolution=R,
+            layout=GRAPH_LAYOUT,
+            isolate_border_width=0.5 * self.local_patch_size,
+            isolate_border_bounds=(self.map_xmin, self.map_xmax,
+                                   self.map_ymin, self.map_ymax),
+            isolated_node_payloads={
+                "cmd_v": float(self.toorisky_v),
+                "cmd_w": float(self.toorisky_w),
+                "meta": int(TravmapInfo_IntEnum.TRAV_Estimated.value),
+            },
+        )
+        try:
+            # ---- post-construction verification against the expected lattice -
+            active = np.asarray(writer.node_active[:writer.node_hwm])
+            n_active = int(np.count_nonzero(active == 1))
+            if n_active != rows_expected * cols_expected:
+                raise SharedGraphError(
+                    f"_build_shared_graph: graph has {n_active} active nodes, "
+                    f"expected {rows_expected * cols_expected} "
+                    f"({rows_expected}x{cols_expected})")
+            nx = np.asarray(writer.node_x[:writer.node_hwm])[active == 1]
+            ny = np.asarray(writer.node_y[:writer.node_hwm])[active == 1]
+            if not (np.all(nx >= snapped_xmin - coord_tol)
+                    and np.all(nx <= snapped_xmax + coord_tol)
+                    and np.all(ny >= snapped_ymin - coord_tol)
+                    and np.all(ny <= snapped_ymax + coord_tol)):
+                raise SharedGraphError(
+                    "_build_shared_graph: some node centers fall outside the "
+                    "snapped storage bounds; grid geometry is inconsistent")
+            # every node center must sit on a lattice multiple of R (within tol)
+            kx = np.round((nx.astype(np.float64) - lattice_xmin) / R)
+            ky = np.round((ny.astype(np.float64) - lattice_ymin) / R)
+            if not (np.all(np.abs(kx * R + lattice_xmin - nx) <= coord_tol)
+                    and np.all(np.abs(ky * R + lattice_ymin - ny) <= coord_tol)):
+                raise SharedGraphError(
+                    "_build_shared_graph: node centers are not aligned to the "
+                    f"estimation lattice (R={R}); float32 roundoff exceeded "
+                    f"coord_tol={coord_tol:.3g}")
+        except Exception:
+            # Never retain a graph that fails verification.
+            writer.cleanup()
+            raise
+
+        # Commit the owned writer and the runtime-resolution parameters.
+        self.graph_writer = writer
+        self._graph_lattice_bounds = (lattice_xmin, lattice_xmax,
+                                      lattice_ymin, lattice_ymax)
+        self._graph_coord_tol = coord_tol
+
+        print(f"[shared-graph] built lattice graph: {n_active} nodes "
+              f"({rows_expected}x{cols_expected}), edge_hwm={writer.edge_hwm}, "
+              f"n_max={writer.n_max}, e_max={writer.e_max}, R={R}, "
+              f"snapped bounds x[{snapped_xmin}, {snapped_xmax}] "
+              f"y[{snapped_ymin}, {snapped_ymax}], lookup_radius={writer.default_lookup_radius}. "
+              f"Edges store immutable geometric length only (no cmd/status/cost).")
+
+    def _close_shared_graph(self):
+        """Idempotently close + unlink the owned graph (shutdown hook)."""
+        gw = self.graph_writer
+        if gw is not None:
+            self.graph_writer = None
+            gw.cleanup()
+
+    def _graph_layer_too_risky_mask(self, cmd_v_row, cmd_w_row, meta_row):
+        """
+        (num_layers,) bool mask: True for each heading layer that has estimated
+        meta AND is left at the too-risky command sentinel. This is the
+        SINGLE too-risky predicate, reused by _apply_graph_update and the Part 2 tests.
+
+        A layer is too-risky iff meta is TRAV_Estimated and
+        cmd_v/cmd_w equal (toorisky_v, toorisky_w). Meta alone is never
+        sufficient: the exact sentinel pair is still required.
+
+        cmd_v_row / cmd_w_row : (num_layers,) command values for one node.
+        meta_row              : (num_layers,) per-layer TravmapInfo_IntEnum status.
+        """
+        TRAV_Estimated = int(self.TravmapInfo_IntEnum.TRAV_Estimated.value)
+        tv = np.float32(self.toorisky_v)          # float32 sentinel matching stored payload
+        tw = np.float32(self.toorisky_w)
+        meta = np.asarray(meta_row).astype(np.int64)
+        supported_meta = (meta == TRAV_Estimated)
+        at_sentinel = ((np.asarray(cmd_v_row, dtype=np.float32) == tv)
+                       & (np.asarray(cmd_w_row, dtype=np.float32) == tw))
+        return supported_meta & at_sentinel
+
+    def _graph_node_has_too_risky(self, cmd_v_row, cmd_w_row, meta_row):
+        """True iff any heading layer has supported meta and the too-risky sentinel pair."""
+        return bool(self._graph_layer_too_risky_mask(cmd_v_row, cmd_w_row, meta_row).any())
+
+    def _apply_graph_update(self, graph_records):
+        """
+        Mirror one map update's coarse-lattice write-back into the shared graph
+        and maintain the aggregate too-risky topology invariant.
+
+        graph_records : list of (x, y, theta_layer, cmd_v, cmd_w, meta) captured
+            at the point each value is DECIDED — the _compute_travmap Step-9
+            loop. The payload is
+            carried in the record (direct write); TraversabilityMap /
+            TravMap_MetaInfo are NOT read back here, so the graph no longer
+            depends on the dense grid (still a mirror, never a second
+            calculation — the carried values are the exact values the dense
+            write used).
+
+        All predictable coordinate/payload validation completes before the outer
+        edit_batch() opens. Any graph-mutation exception propagates out (the
+        caller must stop, not keep using the graph): edit_batch() is only a
+        reader publication barrier, not a rollback.
+        """
+        gw = self.graph_writer
+        if gw is None or not graph_records:
+            return
+
+        R = float(self.TravUpdate_XYResolution)
+        tol = float(self._graph_coord_tol)
+        lxmin, lxmax, lymin, lymax = self._graph_lattice_bounds
+        n_layers = int(self.TraversabilityMap_size_layers)
+        lookup_r = gw.default_lookup_radius       # 0.75 * R (lookup only)
+
+        # ---- 1) preflight: resolve slots, read final map values, group -------
+        # by_slot: slot -> list of (theta_layer, cmd_v_f32, cmd_w_f32, meta_int)
+        by_slot = {}
+        slot_xy = {}                              # slot -> (stored_x, stored_y) for reconnect queries
+        out_of_domain = 0                         # per-update skip counter (logged once)
+        for rec in graph_records:
+            x, y, theta_layer = float(rec[0]), float(rec[1]), int(rec[2])
+            # Classify against the RETAINED lattice-center bounds (not the
+            # half-cell-extended storage bounds), with the float tolerance.
+            if not (lxmin - tol <= x <= lxmax + tol and lymin - tol <= y <= lymax + tol):
+                out_of_domain += 1
+                continue
+            if theta_layer < 0 or theta_layer >= n_layers:
+                raise SharedGraphError(
+                    f"_apply_graph_update: heading layer {theta_layer} out of range "
+                    f"[0, {n_layers}) for point ({x:.6g}, {y:.6g})")
+            # Resolve once with the default lookup radius; -1 on a miss.
+            slot = gw.nearest_node(x, y)
+            if slot == -1:
+                raise SharedGraphError(
+                    f"_apply_graph_update: in-domain point ({x:.6g}, {y:.6g}) did not "
+                    f"resolve to any graph node within lookup_radius={lookup_r:.6g}; "
+                    f"lattice-center bounds x[{lxmin}, {lxmax}] y[{lymin}, {lymax}], "
+                    f"R={R}, coord_tol={tol:.3g} — lattice/graph mismatch")
+            # A lookup hit alone is insufficient (radius is 0.75*R): require the
+            # stored float32 coordinate to equal the expected lattice coordinate.
+            resolved_x = gw.node_x[slot]
+            resolved_y = gw.node_y[slot]
+            if not (np.isclose(resolved_x, x, rtol=0.0, atol=tol)
+                    and np.isclose(resolved_y, y, rtol=0.0, atol=tol)):
+                raise SharedGraphError(
+                    f"_apply_graph_update: point ({x:.6g}, {y:.6g}) resolved to node "
+                    f"{slot} at ({float(resolved_x):.6g}, {float(resolved_y):.6g}) but the "
+                    f"stored coordinate differs by more than coord_tol={tol:.3g}; "
+                    f"lattice-center bounds x[{lxmin}, {lxmax}] y[{lymin}, {lymax}], "
+                    f"R={R}, lookup_radius={lookup_r:.6g} — off-lattice write-back point")
+            # Unpack the CARRIED payload decided at the capture site (direct
+            # write — no dense-grid read-back). The coarse point's own fine cell
+            # keeps its Step-9 value through the interpolation pass (the cell is
+            # a bilinear corner), so the carried value equals exactly the
+            # cmd_v/cmd_w/meta the dense map holds for this point+layer.
+            cmd_v = np.float32(rec[3])
+            cmd_w = np.float32(rec[4])
+            # Finiteness guard kept on the carried values (defensive; the
+            # capture sites already guarantee finite commands).
+            if not (np.isfinite(cmd_v) and np.isfinite(cmd_w)):
+                raise SharedGraphError(
+                    f"_apply_graph_update: non-finite carried command ({cmd_v}, {cmd_w}) "
+                    f"at ({x:.6g}, {y:.6g}) layer {theta_layer}; cannot mirror into the graph")
+            meta_value = int(rec[5])
+            by_slot.setdefault(int(slot), []).append((theta_layer, cmd_v, cmd_w, meta_value))
+            slot_xy[int(slot)] = (float(resolved_x), float(resolved_y))
+
+        if out_of_domain:
+            # One summary per map update, not one line per point.
+            print(f"[shared-graph] skipped {out_of_domain} write-back point(s) outside "
+                  f"the retained lattice-center bounds x[{lxmin}, {lxmax}] "
+                  f"y[{lymin}, {lymax}]")
+
+        if not by_slot:
+            return
+
+        # ---- 2) stage final per-node too-risky state (independent of order) --
+        # Live read-only views into the writer payload arrays (reflect writes
+        # made inside the batch below once step 3.1 runs).
+        cur_cmd_v = gw.node_payload('cmd_v')      # (n_max, n_layers) float32
+        cur_cmd_w = gw.node_payload('cmd_w')
+        cur_meta = gw.node_payload('meta')        # (n_max, n_layers) uint8
+        old_has_too_risky = {}
+        final_has_too_risky = {}
+        for slot, updates in by_slot.items():
+            staged_v = np.array(cur_cmd_v[slot], dtype=np.float32)   # (n_layers,) copy
+            staged_w = np.array(cur_cmd_w[slot], dtype=np.float32)
+            staged_m = np.array(cur_meta[slot], dtype=np.uint8)
+            old_has_too_risky[slot] = self._graph_node_has_too_risky(staged_v, staged_w, staged_m)
+            for (L, v, w, mv) in updates:          # apply every layer update to the staged copy
+                staged_v[L] = v
+                staged_w[L] = w
+                staged_m[L] = mv
+            final_has_too_risky[slot] = self._graph_node_has_too_risky(staged_v, staged_w, staged_m)
+
+            # ── Replanning-gate accounting ───────────────────────────────────────────
+            # A node counts as changed only when its FINAL payload actually differs from what
+            # the graph already holds. Re-estimating unchanged terrain — the Case-C random
+            # gap-filling path, which fires every tick at RandomRate_TravUpdate — rewrites
+            # identical values and therefore contributes nothing. This is what makes the gate
+            # selective; a naive len(graph_records) count would be large on every tick.
+            eps = self._replan_cmd_change_eps
+            if (np.any(np.abs(staged_v - cur_cmd_v[slot]) > eps)
+                    or np.any(np.abs(staged_w - cur_cmd_w[slot]) > eps)
+                    or np.any(staged_m != cur_meta[slot])):
+                self.map_change_stats['graph_nodes_value_changed'] += 1
+            # Tier 1: a flip is exactly what adds/removes edges in steps 3.2-3.4 below, i.e.
+            # the only graph change that can make a path infeasible or unlock a shortcut.
+            if old_has_too_risky[slot] != final_has_too_risky[slot]:
+                self.map_change_stats['graph_toorisky_flips'] += 1
+
+        # ---- 3) apply everything under one outer edit_batch (publication) ----
+        with gw.edit_batch():
+            # 3.1 payload updates through explicit indexed={...} syntax; one
+            #     three-field call bumps this node's update_version once.
+            for slot, updates in by_slot.items():
+                for (L, v, w, mv) in updates:
+                    gw.update_node_payload(
+                        slot,
+                        indexed={
+                            "cmd_v": (L, v),
+                            "cmd_w": (L, w),
+                            "meta": (L, mv),
+                        },
+                    )
+            # 3.2 isolate every affected node whose FINAL state is too-risky
+            #     (degree 0). remove_edges_of_node on an already-detached active
+            #     node is a no-op returning 0.
+            for slot in by_slot:
+                if final_has_too_risky[slot]:
+                    gw.remove_edges_of_node(slot)
+            # 3.3 reconnect only nodes that transitioned too-risky -> not-too-risky,
+            #     restoring their orthogonal/diagonal grid neighbors via a generic
+            #     radius query at exactly 2.0*default_lookup_radius (== 1.5*R for
+            #     the lattice graph, since create_grid stores default_lookup_radius
+            #     = 0.75*R). Sourcing the radius from the graph frontend keeps this
+            #     reconnect off the map's fixed-resolution field. Collect the
+            #     generic in-radius candidates considered for the final isolation pass.
+            reconnect_candidates = set()
+            for slot in by_slot:
+                if old_has_too_risky[slot] and not final_has_too_risky[slot]:
+                    sx, sy = slot_xy[slot]
+                    gw.connect_node(slot, radius=2.0 * gw.default_lookup_radius)
+                    for c in gw.radius_query(sx, sy, 2.0 * gw.default_lookup_radius):
+                        c = int(c)
+                        if c != slot:
+                            reconnect_candidates.add(c)
+            # 3.4 final isolation pass: a generic reconnect may have wired an edge
+            #     to a candidate that itself still has a too-risky layer (its own
+            #     current or this-cycle final state). Re-isolate every such
+            #     candidate so no edge is incident to a too-risky node.
+            for c in reconnect_candidates:
+                if c in final_has_too_risky:
+                    still_too_risky = final_has_too_risky[c]
+                else:
+                    # Not updated this cycle: its live payload is unchanged.
+                    still_too_risky = self._graph_node_has_too_risky(
+                        cur_cmd_v[c], cur_cmd_w[c], cur_meta[c])
+                if still_too_risky:
+                    gw.remove_edges_of_node(c)
 
 
     def _compute_travmap(self, estimating_xypts_set, estimating_area_xmin, estimating_area_xmax, estimating_area_ymin, estimating_area_ymax):
@@ -1438,7 +1921,10 @@ class CMDbasedMap(BaseMap):
                 (patch_tensor, np.zeros((pad, P, P))), axis=0
             )  # (size, P, P), size = next multiple of 64 ≥ M
             # Duplicate: first 'size' rows → cmd_v evaluation, next 'size' rows → cmd_w evaluation.
-            patch_cat_tensor = np.concatenate((patch_tensor_extended, patch_tensor_extended), axis=0)  # (2*size, P, P)
+            # TEMPORARY PATCH: cmd_w is derived from cmd_v after the chunk loop, so the cmd_w
+            # half is never evaluated → no duplication (halves the inference batch).
+            # patch_cat_tensor = np.concatenate((patch_tensor_extended, patch_tensor_extended), axis=0)  # (2*size, P, P)
+            patch_cat_tensor = patch_tensor_extended  # (size, P, P), cmd_v evaluation only
             size = patch_tensor_extended.shape[0]  # multiple of 64; only indices 0..M-1 hold real patches
 
             # ── Step 7: Candidate speed bins ──────────────────────────────────────────
@@ -1465,29 +1951,38 @@ class CMDbasedMap(BaseMap):
             # Skip inference entirely when size==0 (all patches were NaN/OOB): every
             # xyc_patchindex entry already has patchindex==-1, so Step 9 will fall back
             # to InitialGuess for all points without needing TravFormer output.
-            CMD_CHUNK = 4
+            CMD_CHUNK = 2
             n_bins = len(v_bins)  # total number of candidate speed levels to evaluate
             chunk_start = 0
             while size > 0 and chunk_start < n_bins:
                 # chunk_v/chunk_w: (n_chunk,) — velocity bins in this chunk (descending order,
                 # so the largest feasible speed is assigned first and later bins are skipped by the mask guard)
                 chunk_v = v_bins[chunk_start : chunk_start + CMD_CHUNK]
-                chunk_w = w_bins[chunk_start : chunk_start + CMD_CHUNK]
+                # chunk_w = w_bins[chunk_start : chunk_start + CMD_CHUNK]
                 n_chunk = len(chunk_v)  # ≤ CMD_CHUNK; may be smaller for the last chunk
 
                 # patch_chunk: (n_chunk*2*size, P, P)
                 # patch_cat_tensor is (2*size, P, P): first half for cmd_v eval, second for cmd_w eval.
                 # Replicated n_chunk times so that each bin j occupies rows [j*2*size : (j+1)*2*size].
+                # TEMPORARY PATCH: patch_cat_tensor is (size, P, P) now, so patch_chunk is
+                # (n_chunk*size, P, P) and bin j occupies rows [j*size : (j+1)*size].
                 patch_chunk = np.concatenate([patch_cat_tensor] * n_chunk, axis=0)
 
                 # cmd_chunk: (n_chunk*2*size, 2) — command pairs [cmd_v, cmd_w].
                 # For bin j:
                 #   rows [j*2*size       : j*2*size+size] → col 0 = v, col 1 = 0  (v-only evaluation)
                 #   rows [j*2*size+size  : (j+1)*2*size ] → col 0 = 0, col 1 = w  (w-only evaluation)
-                cmd_chunk = np.zeros((n_chunk * 2 * size, 2))
-                for j, (v, w) in enumerate(zip(chunk_v, chunk_w)):
-                    cmd_chunk[j*2*size        : j*2*size + size,  0] = v
-                    cmd_chunk[j*2*size + size : (j+1)*2*size,     1] = w
+                # TEMPORARY PATCH: cmd_w is no longer swept, so only the v-rows remain:
+                #   rows [j*size : (j+1)*size] → col 0 = v, col 1 = 0  (v-only evaluation)
+                # The second column MUST be kept (the model slices commands[:, 1:2] and its
+                # cmd_proj expects 2*(2*num_freqs+1) inputs), it just stays zero.
+                # cmd_chunk = np.zeros((n_chunk * 2 * size, 2))
+                cmd_chunk = np.zeros((n_chunk * size, 2))
+                # for j, (v, w) in enumerate(zip(chunk_v, chunk_w)):
+                #     cmd_chunk[j*2*size        : j*2*size + size,  0] = v
+                #     cmd_chunk[j*2*size + size : (j+1)*2*size,     1] = w
+                for j, v in enumerate(chunk_v):
+                    cmd_chunk[j*size : (j+1)*size, 0] = v
 
                 try:
                     start = time()
@@ -1508,35 +2003,77 @@ class CMDbasedMap(BaseMap):
                 # VaR_chunk: (n_chunk, 2*size) — Value-at-Risk instability per (bin, patch).
                 # VaR_chunk[j, :size]  → v-evaluation VaR for bin j across all patches
                 # VaR_chunk[j, size:]  → w-evaluation VaR for bin j across all patches
-                VaR_chunk = (instab_mean_cat[:,0] + instability_std_multiplier*instab_std_cat[:,0]).reshape(n_chunk, 2*size)
+                # TEMPORARY PATCH: only the v-half is inferred → (n_chunk, size).
+                # VaR_chunk[j] → v-evaluation VaR for bin j across all patches.
+                # VaR_chunk = (instab_mean_cat[:,0] + instability_std_multiplier*instab_std_cat[:,0]).reshape(n_chunk, 2*size)
+                VaR_chunk = (instab_mean_cat[:,0] + instability_std_multiplier*instab_std_cat[:,0]).reshape(n_chunk, size)
 
-                for j, (v, w) in enumerate(zip(chunk_v, chunk_w)):
-                    VaR = VaR_chunk[j]  # (2*size,)
+                # for j, (v, w) in enumerate(zip(chunk_v, chunk_w)):
+                for j, v in enumerate(chunk_v):
+                    # VaR = VaR_chunk[j]  # (2*size,)
+                    VaR = VaR_chunk[j]  # (size,)
                     # Assign v only to patches still at sentinel (not yet assigned a safe speed)
                     # that now pass the VaR threshold at this speed level.
                     mask_v = (VaR[:size] < self.instability_limit) & (target_v[:, 0] == self.toorisky_v)
                     target_v[mask_v, 0] = v
-                    mask_w = (VaR[size:] < self.instability_limit) & (target_w[:, 0] == self.toorisky_w)
-                    target_w[mask_w, 0] = w
+                    # mask_w = (VaR[size:] < self.instability_limit) & (target_w[:, 0] == self.toorisky_w)
+                    # target_w[mask_w, 0] = w
+                    # TEMPORARY PATCH: derive cmd_w from the cmd_v just assigned. Patches that
+                    # never pass any bin keep the (toorisky_v, toorisky_w) init pair untouched,
+                    # which _graph_layer_too_risky_mask requires as an exact pair.
+                    target_w[mask_v, 0] = self.maximum_cmd_w * v / self.maximum_cmd_v
 
                 chunk_start += n_chunk
 
                 # Early exit: all patches have been assigned a safe speed for both v and w
-                if not (target_v[:, 0] == self.toorisky_v).any() and not (target_w[:, 0] == self.toorisky_w).any():
+                # TEMPORARY PATCH: target_w is derived from target_v afterwards and stays at its
+                # sentinel during the loop, so only the v condition may be tested here.
+                # if not (target_v[:, 0] == self.toorisky_v).any() and not (target_w[:, 0] == self.toorisky_w).any():
+                if not (target_v[:, 0] == self.toorisky_v).any():
                     break
             
-            # Temporarily over-ride target_w Command 
-            safe = target_v[:, 0] != self.toorisky_v
-            target_w[safe, 0] = self.maximum_cmd_w * target_v[safe, 0] / self.maximum_cmd_v
+
+
+            # TEMPORARY PATCH: get target_w by target_v.
+            # Moved into the Step 8 bin loop (target_w[mask_v, 0] = ...) so the too-risky
+            # sentinel pair survives without a repair pass; rebinding target_w here would
+            # overwrite that sentinel again.
+            # target_w = self.maximum_cmd_w * target_v / self.maximum_cmd_v
+            # Restore the exact too-risky sentinel pair: _graph_layer_too_risky_mask requires
+            # cmd_v == toorisky_v AND cmd_w == toorisky_w, but the scaling above would map
+            # toorisky_v to maximum_cmd_w*toorisky_v/maximum_cmd_v (≠ toorisky_w).
+            # target_w[target_v == self.toorisky_v] = self.toorisky_w
 
             
+            # ── Step 8b: Propagate toorisky across all theta directions per (x,y) ─────
+            # If ANY heading at (x, y) fails (toorisky_v OR toorisky_w), force every
+            # heading at that (x, y) to toorisky — unsafe from one direction means the
+            # whole cell is treated as an obstacle.
+            # estimating_xycpts_set is built by tiling all thetas over each (x,y), so
+            # consecutive blocks of n_thetas entries share the same (x,y).
+            n_thetas = self.TraversabilityMap_size_layers
+            if N % n_thetas == 0:
+                # patchindices_2d: (N//n_thetas, n_thetas) — patchindex per (x,y) group
+                patchindices_2d = xyc_patchindex[:, 3].astype(int).reshape(-1, n_thetas)
+                for _i in range(patchindices_2d.shape[0]):
+                    _valid_idx = patchindices_2d[_i][patchindices_2d[_i] >= 0]
+                    if len(_valid_idx) == 0:
+                        continue
+                    if np.any(target_v[_valid_idx, 0] == self.toorisky_v):
+                        target_v[_valid_idx, 0] = self.toorisky_v
+                        target_w[_valid_idx, 0] = self.toorisky_w
 
-
-
-            
             # ── Step 9: Write safe speeds back to TraversabilityMap ──────────────────
             # Iterate all N query points in the same order as estimating_xycpts_set so that
             # patchindex_counter stays aligned with xyc_patchindex rows.
+            #
+            # Shared-graph mirror hook (Part 2): collect the (x, y, heading layer)
+            # touched by this write-back — the update membership and heading-layer
+            # selection computed here, NOT recomputed. None when no graph is owned
+            # (base map, reader proxy, or non-"Astar" planner), which disables the
+            # hook. Each record CARRIES the cmd_v/cmd_w/meta decided here (direct
+            # write); _apply_graph_update no longer reads the dense map back.
+            graph_records = [] if self.graph_writer is not None else None
             patchindex_counter = 0
             for xyc in estimating_xycpts_set:
 
@@ -1572,12 +2109,9 @@ class CMDbasedMap(BaseMap):
                 square_BL_entry = np.array([ round( (self.map_xmax - square_BL_xyc[0])/self.map_resolution ), round( (self.map_ymax - square_BL_xyc[1])/self.map_resolution ) ])
                 square_TR_entry = np.array([ round( (self.map_xmax - square_TR_xyc[0])/self.map_resolution ), round( (self.map_ymax - square_TR_xyc[1])/self.map_resolution ) ])
 
-                # Discretize heading to the nearest TraversabilityMap layer.
-                # wrap_to_pi ensures theta ∈ (-π, π]; the modulo wrap handles θ=π ≡ θ=-π.
+                # Discretize the canonical [-π, π) heading to the nearest layer.
                 theta = Utils.wrap_to_pi(theta)
-                theta_layer = int(np.round((theta - self.TraversabilityMap_theta_min) / self.TraversabilityMap_theta_resolution))
-                if theta_layer == self.TraversabilityMap_size_layers:
-                    theta_layer = 0  # π and -π map to the same layer
+                theta_layer = self.get_theta_layer(theta)
 
                 # Clip pixel bounds to stay within the map and write cmd_v, cmd_w, and status.
                 row_start = int(np.clip(square_TR_entry[0], 0, self.map_size_rows))
@@ -1587,6 +2121,16 @@ class CMDbasedMap(BaseMap):
                 self.TraversabilityMap[row_start:row_end, col_start:col_end, theta_layer, 0] = cmd_v
                 self.TraversabilityMap[row_start:row_end, col_start:col_end, theta_layer, 1] = cmd_w
                 self.TravMap_MetaInfo[row_start:row_end, col_start:col_end, theta_layer] = self.TravmapInfo_IntEnum.TRAV_Estimated.value
+
+                # Shared-graph mirror hook (Part 2): record this coarse point +
+                # heading layer for the post-interpolation graph mirror, carrying
+                # the exact cmd_v/cmd_w decided above plus TRAV_Estimated (direct
+                # write — no dense read-back in _apply_graph_update).
+                if graph_records is not None:
+                    graph_records.append((
+                        float(x), float(y), int(theta_layer),
+                        float(cmd_v), float(cmd_w),
+                        int(self.TravmapInfo_IntEnum.TRAV_Estimated.value)))
 
 
 
@@ -1616,9 +2160,7 @@ class CMDbasedMap(BaseMap):
 
             for xyc in estimating_xycpts_set:
                 theta = Utils.wrap_to_pi(xyc[2])
-                theta_layer = math.floor(np.round((theta - self.TraversabilityMap_theta_min) / self.TraversabilityMap_theta_resolution))
-                if theta_layer == self.TraversabilityMap_size_layers:
-                    theta_layer = 0  # pi = -pi
+                theta_layer = self.get_theta_layer(theta)
 
                 row_BL, col_BL = self.xy2grid(xyc[0], xyc[1])
                 if row_BL is None or col_BL is None:
@@ -1665,3 +2207,11 @@ class CMDbasedMap(BaseMap):
                         _interp_vals = patch.transpose(1, 0, 2)
                         _row_sl, _col_sl = slice(row_BL,   row_BL+N+1), slice(col_BL,   col_BL+N+1)
                     self.TraversabilityMap[_row_sl, _col_sl, theta_layer, :] = _interp_vals
+
+            # ── Shared-graph mirror + topology (Part 2) ──────────────────────────
+            # The map is now final for this update (Step 9 + interpolation done).
+            # Mirror the coarse-lattice cmd_v/cmd_w/meta into node payloads and
+            # maintain the aggregate too-risky topology inside one edit_batch().
+            # No-op when no graph is owned; graph-mutation exceptions propagate.
+            if graph_records is not None:
+                self._apply_graph_update(graph_records)

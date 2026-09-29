@@ -71,8 +71,9 @@ setup(
     ],
     entry_points={
         'console_scripts': [
-            'traversability_estimation = executables.main_worldmodel:main',
-            'global_planning = executables.main_global_planning:main',
+            'main_worldmodel = executables.main_worldmodel:main',
+            'main_fsm = executables.main_fsm:main',
+            'main_global_planning = executables.main_global_planning:main',
             'main_multiprocess = executables.main_multiprocess:main',
         ],
     },

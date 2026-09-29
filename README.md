@@ -1,7 +1,8 @@
 # STATE-NAV: Stability-Aware Traversability Estimation for Bipedal Navigation on Rough Terrain
 
 ## Update News!
-Now working on adding A* (path would be discrete but is faster than RRT* by 100x for the attached ROSbag env) and integrating STATE-NAV's bipedal traversability with VLN - VAMOS (https://vamos-vla.github.io/)
+[Oct 01 2026]
+- A* added in this branch (ROS2): paths are discrete, but ~100x faster than RRT* on the attached ROS bag environment. The old RRT* version can be found in the ROS2_dev branch.
 
 [Jul 04 2026] ROS2 version with Docker setting, ROS2 bag, etc. available! 
 Also major updates and refactoring in code: now ~10x faster running.
@@ -15,7 +16,7 @@ Checkpoint for Unitree G1's blind locomotion controller released.
 ![Teaser image](./images/teaser.png)
 
 ### Practical sub-module use cases
-- **Get TravRRT for Terrain Navigation**: A computationally efficient RRT* for terrain navigation with traversability. Theoretically, RRT* assumes Lipschitz-continuous costs, which break on rough terrain where traversability changes abruptly, and forcing large rewiring radius. TravRRT* avoids this by biased sampling toward high-traversability regions—much like how humans just ignore infeasible paths (you don’t even think about walking through a bush, do you?). (Why not A*? yaw angle makes the search 3D! High computation. And also, heuristics for computing h(x).)
+- **Get A\* for Terrain Navigation**: A heading-aware A* over a shared-memory traversability graph. Edge costs are travel times derived from the stability-aware velocity map with a curvature-limited turn model, so the yaw dimension is handled without a full 3D search. The previous TravRRT* planner is available in the ROS2_dev branch.
   
 - **Get Bipedal Traversability for Humanoids**: An off-the-shelf bipedal traversability map—insert an elevation map, receive a traversability map.
 
@@ -26,9 +27,9 @@ Checkpoint for Unitree G1's blind locomotion controller released.
 
 - **Velocity-based traversability: Robot-specific (environment-agnostic) cost formulation**: Represents traversability not as a unitless cost or score, but as velocity with physical meaning. Defines the fastest velocity that a robot can traverse while maintaining instability (a robot-specific parameter) risk-sensitively within acceptable limits. This velocity representation replaces traditional path planning costs of $c_{ij} = \sum_{k \in M} (1 + w(1/t_k))^p \Delta l_k$ which depends on environment-specific hyperparameter $w$ that requires retuning for every environment.
 
-- **Safe learning-planning integration**: Rather than end-to-end learning, leverages the learned model where it can do what models cannot and integrates the learned representation effectively within a hierarchical planning strategy—as a cost term in RRT* path planning and as a constraint in MPC local planning.
+- **Safe learning-planning integration**: Rather than end-to-end learning, leverages the learned model where it can do what models cannot and integrates the learned representation effectively within a hierarchical planning strategy—as a cost term in global path planning (TravRRT* in the paper, A* in this branch) and as a constraint in MPC local planning.
 
-- **Modular and extensible**: Provides researchers with traversability maps and path plans for bipedal locomotion trained with Digit. Support for other robots will be added in future releases.
+- **Modular and extensible**: Provides researchers with traversability maps and path plans for bipedal locomotion trained with Digit. This branch ships a TravFormer checkpoint for Unitree G1 (`statenav_global/inference/checkpoints/checkpoint_MLL_23.pth`).
 
 
 ### Key Features
@@ -37,7 +38,7 @@ Checkpoint for Unitree G1's blind locomotion controller released.
 Traversability is defined as a stability-aware command velocity: the fastest command that keeps predicted instability within a user-specified limit.
 The model supports risk-aware planning via Value at Risk (VaR) and operates directly from elevation maps.
 
-- **TravRRT Global Planning**: A global planner that leverages the predicted stability-aware velocity to generate time-efficient and risk-sensitive paths.
+- **A\* Global Planning**: A heading-aware A* global planner that leverages the predicted stability-aware velocity to generate time-efficient and risk-sensitive paths.
 Consistently avoids unsafe terrain without manual weight tuning or environment-specific adjustments.
 
 
@@ -154,7 +155,7 @@ The configuration file allows users to change various parameters related to trav
 ### Step 2 — Build the safe-terrain map (first terminal)
 
 ```bash
-ros2 run statenav_global traversability_estimation
+ros2 run statenav_global main_worldmodel
 ```
 
 
@@ -167,11 +168,11 @@ ros2 run statenav_global traversability_estimation
 ### Step 3 — Plan a path (second terminal)
 
 ```bash
-ros2 run statenav_global global_planning
+ros2 run statenav_global main_global_planning
 ```
 
 ```bash
-# Launches the global path planning node that uses TravRRT* to compute optimal paths
+# Launches the global path planning node that uses a heading-aware A* to compute optimal paths
 # based on the traversability maps. This node subscribes to costmaps and robot pose,
 # then publishes planned paths for navigation.
 ```
@@ -206,8 +207,8 @@ rviz2 -d $(path_to_your_ros2_workspace)/statenav_ws/src/state_nav/ROS/rviz_setti
 | Step | Command                     | What you get              |
 | ---- | --------------------------- | ------------------------- |
 | 1    | Edit `planning_config.yaml` | Start, goal, and settings |
-| 2    | `traversability_estimation` | Safe-terrain map          |
-| 3    | `global_planning`           | Path to goal planning     |
+| 2    | `main_worldmodel`           | Safe-terrain map          |
+| 3    | `main_global_planning`      | Path to goal planning     |
 | 4    | `ros2 bag play ...`         | Demo replay               |
 | 5    | `rviz2 -d ...`              | Visualization             |
 
@@ -221,6 +222,6 @@ The Docker setup and RViz visualization configurations are adapted from [elevati
 
 ### RRT* Path Planning
 
-The RRT* (Rapidly-exploring Random Tree Star) implementation is based on [pypolo](https://github.com/Weizhe-Chen/pypolo) ([MIT License](https://github.com/Weizhe-Chen/pypolo/blob/main/LICENSE)), a Python library for Robotic Information Gathering.
+The RRT* (Rapidly-exploring Random Tree Star) implementation in the ROS2_dev branch is based on [pypolo](https://github.com/Weizhe-Chen/pypolo) ([MIT License](https://github.com/Weizhe-Chen/pypolo/blob/main/LICENSE)), a Python library for Robotic Information Gathering.
 
 We gratefully acknowledge the contributions of these projects to the robotics community.
