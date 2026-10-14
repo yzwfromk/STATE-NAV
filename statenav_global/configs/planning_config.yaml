@@ -23,7 +23,7 @@ heading_start:  10.0
 initialization_time: 17.0
 # Init-window layout. The window is SCHEDULED BY THE FSM and COMMANDED BY THE LOCAL PLANNER:
 # NavigationFSM derives the three phase boundaries below from /clock and publishes the phase on
-# /fsm_state, and Bipedal_Planning_MPC issues every /robot/cmd_vel of that phase. IsaacLab takes no
+# /fsm_state, and the MPPI local planner (main_mppi) issues every /robot/cmd_vel of that phase. IsaacLab takes no
 # part in the init motion any more - it publishes /clock from step 0 and gates the cloud, nothing
 # else.
 #   INITIALIZATION_SETTLING  [0, cloud_settle_time)                                    zero command
@@ -72,9 +72,25 @@ local_patch_size: 0.64  # m
 #   k -> 0   → nearly linear interpolation (constant slope between corners)
 #   k = 5    → moderate S-curve: gentle plateaus near corners, smooth mid transition (default)
 #   k >= 20  → near step / nearest-neighbor: sharp blocky transition around the midpoint
-interp_sigmoid_k: 5.0
+interp_sigmoid_k: 10.0
+mppi_footprint_radius: 0.3
+mppi_footprint_samples: 8
+conservative_speed_v: 0.5   # m/s
+conservative_speed_w: 0.6   # rad/s
+# Command-domain and rate constraints.
+mppi_lin_acc_ub: 5.0 # Don't lower down to ensure in-place turning
+mppi_ang_acc_ub: 5.0
+mppi_goal_taper_acc_frac: 0.15
+goal_threshold: 0.5
+ma_window_s: 0.3
 instability_limit: 1.6
 instability_std_multiplier: 3.5
+# Max elevation patches per TravFormer forward pass (rounded down to a multiple of 64). Bounds the
+# GPU memory of traversability estimation, which is linear in it: measured 0.165 MB/patch on the
+# RTX 5090 (1.96 GB at 11,776 patches, 25.9 GB at 156,928), so 30000 -> ~5 GB. Matters for the
+# full-map build of known-environment mode (50 x 50 m = 78k patches per speed bin); runtime updates
+# are far smaller. Halved automatically on CUDA OOM.
+travformer_max_batch_patches: 30000
 
 
 maximum_cmd_v: 1.5
@@ -96,7 +112,6 @@ RandomRate_TravUpdate: 0.1
 
 
 use_shared_memory: True
-use_gridmap_msg: true  # True for GridMap, False for Float32MultiArray
 pub_travmap_visualization: True  # publish /travmap_visualization GridMap (elevation + north cmd_v) for Rviz2
 
 ## Travmap Visualization Publish Rate (main_worldmodel.py, main_traversability_estimation.py)
@@ -192,9 +207,162 @@ arc_radius_factor: 0.85
 ####################### Waypoint / Debug #######################
 # debug
 debug_print: True
+# Target period of the run() control loop (s); also the minimum dt floor applied before spin_once.
+# CAUTION: Must be ≤ 1 / ROS_spin_rate. Too large → slow reaction; too small → busy-waits and wastes CPU.
+mppi_visualization: true
+mppi_trajectory_trail_length: 500
+# Exactly one local controller is constructed at startup.
+local_planner_type: mppi  # mppi (only value; the pure-pursuit planner was removed)
+# PyTorch rollout geometry and runtime budget. `auto` selects CUDA when it is
+# available; CPU uses the smaller sample count below.
+mppi_device: auto  # auto | cpu | cuda
+mppi_horizon: 7
+# Fixed prediction-knot interval (s), independent of measured ROS-loop jitter.
+mppi_dt: 0.5
+# Time (s) for actual linear/angular velocity to reach 95% of a step command.
+mppi_lag_time: 1.0
+ctrl_period: 0.3
+# Control period (s) used ONLY inside the INITIALIZATION branch of the local planner's run loop.
+# That branch runs no MPPI solve - it just publishes the init command - so it can tick far faster
+# than ctrl_period, and it has to: the sweep's phase switches (+amp -> -amp -> recentre) are
+# detected once per tick, so at ctrl_period=0.3 and init_yaw_rate=1.0 each switch overshoots by up
+# to 0.3 rad (~17 deg). At 0.05 s that drops to ~3 deg, which matches the sweep's recentre tolerance.
+init_ctrl_period: 0.05
+# Sized against mppi_iterations below: a tick costs iterations * num_samples rollouts, so
+# these are ~2/3 of the single-pass counts they replace (1536 / 512), to keep the tick inside
+# ctrl_period while running two update passes.
+mppi_num_samples: 1024 # Good to be a multiple of 32
+mppi_cpu_num_samples: 352
+mppi_lambda: 10
+mppi_adaptive_temperature: True
+mppi_adaptive_temperature_target_ess: 0.05
+mppi_adaptive_temperature_max_scale: 1000.0
+mppi_noise_v: 0.35
+mppi_noise_w: 0.30
+# Width in KNOTS of the symmetric kernel that smooths the sampled command noise ALONG the
+# horizon. 1 = independent per-knot noise (the historical behaviour); 3 correlates
+# neighbouring knots (rho ~ 0.67) so one draw proposes a sustained manoeuvre instead of
+# jitter that largely cancels over the rollout. Must be odd and <= mppi_horizon. The
+# per-knot marginal std stays exactly mppi_noise_v / mppi_noise_w at every width, so this
+# changes the SHAPE of the exploration and not its magnitude -- but the exploration per
+# MANOEUVRE does go up, so mppi_noise_w may want retuning downward after enabling it.
+mppi_noise_smoothing_taps: 3
+# MPPI update passes per control tick. Each pass re-samples around the plan the previous one
+# settled on, which is what lets the horizon's tail converge inside a tick instead of over
+# several. Solve time scales linearly with this: budget mppi_num_samples above against
+# ctrl_period and watch the "solve=..ms" field in the tick trace.
+mppi_iterations: 2
+mppi_map_snapshot_retries: 3
+# The MPPI's terrain comes only from the world model's shared travgraph, sigmoid-interpolated at
+# runtime (same S-curve as the dense map: trav_estimation_resoultion, interp_sigmoid_k); the dense
+# TraversabilityMap is never read. Needs global_planner_type: Astar (only mode that builds it).
+# true: evaluate the interpolation once per graph version over the whole fine grid on the device
+# (a rollout lookup is then one gather; +7.8 MB device memory). false: evaluate it per lookup
+# (7 extra kernel launches each; measured +15% mean solve time).
+mppi_travgraph_rasterize: true
+# Best-sample guard. The MPPI update is a softmax-weighted MEAN of the sampled plans, and
+# on a bimodal batch -- turn left of the hazard, turn right of it -- the mean lands BETWEEN
+# the modes, where the cost is higher than either. The guard issues the cheapest rollout the
+# batch actually drew whenever
+#     settled_cost > best_sample_cost + mppi_guard_margin * |best_sample_cost|
+# The margin (dimensionless) is what stops the plan chattering between the mean and a sample
+# on float noise; 0 swaps on a rounding step, and a large value disables the guard by never
+# firing. Adoption is counted on the "guard:" line of the tick trace, together with how many
+# of the deterministic pivot seeds survived the validity screen. Sharpening lambda is NOT an
+# alternative: the adaptive-temperature controller is already pinned at its ESS floor on the
+# ticks this fires on.
+mppi_guard_margin: 0.10
+# Corridor funnel veto (a hard constraint, not a weight). The cross-track of every rollout
+# knot k must satisfy
+#     xt_k <= max(mppi_corridor_half_width, d0 * mppi_corridor_decay**k)
+# with d0 the robot's own current cross-track. On the path that is a plain tube; off it the
+# bound shrinks toward the tube, so the admissible rollouts are exactly the ones converging
+# back, and the term never vetoes where the robot IS -- only where it is going.
+#
+# The half-width (m) is sized from the geometry it must permit rather than from the cost
+# scale: clearing the mppi_footprint_radius ring of ONE bad map cell
+# (trav_estimation_resoultion = 0.5 m) needs ~0.5 m of lateral room, so 0.6 m is the
+# smallest tube that still allows a genuine one-cell dodge around a too-risky patch while
+# forbidding the "abandon the path and route around it" excursions the terrain cost would
+# otherwise buy. This is deliberately NOT paired with a too-risky VETO: a hard corridor plus
+# a hard too-risky veto can be jointly infeasible (a stamped patch spanning the corridor
+# leaves no admissible sample), and the only resolutions would be to leave the path or to
+# stop. Corridor hard, too-risky soft.
+mppi_corridor_half_width: 0.60
+# Per-knot shrink factor, in (0, 1]. 1.0 is the pure non-increasing funnel ("never move
+# further out"); below 1.0 it additionally DEMANDS lateral convergence at every knot. When
+# no rollout satisfies the bound the term ABSTAINS (relaxed, see below) rather than holding the
+# robot, and says so on the "Corridor:" line of the tick trace -- an abstaining term is an
+# ABSENT one, so that count is the number to watch here.
+#
+# 1.0 by measurement: a robot beside the path must TURN before it can converge, and cannot
+# do both in one knot, so a decaying bound vetoes the very manoeuvre that re-acquires the
+# path. On the flat-map bench at 2.5 m and 1.2 m off, decay 0.85 admitted 0/256 samples and
+# abstained on every batch, while 0.95 admitted 202/256 and 1.00 admitted 232/256 -- both
+# still vetoing the samples that move further out. Lower this only with the abstention
+# count in view.
+mppi_corridor_decay: 1.0
+# (m) Graceful abstention: with no rollout inside the funnel, keep only those whose worst-knot
+# excess is within this slack of the least-violating one, instead of admitting every rollout.
+mppi_corridor_abstain_slack: 0.10
+# Reverse-heading funnel veto (a hard constraint, not a weight) for reversed_geometry rollouts,
+# i.e. reverse driving. Nothing in this release drives in reverse, so both keys are inert; they
+# stay because MPPIConfig reads them. The heading error of every rollout knot k, measured against
+# the REVERSED reference tangent, must satisfy
+#     |yaw_err_k| <= max(mppi_recovery_heading_limit, e0 * mppi_recovery_heading_decay**k)
+# with e0 the robot's own current heading error. The limit (rad) must be in (0, pi).
+mppi_recovery_heading_limit: 1.5708
+# Per-knot shrink factor, in (0, 1]. 1.0 is the pure non-increasing funnel ("never turn
+# further off").
+mppi_recovery_heading_decay: 1.0
+# Cost weights. Out-of-map/toorisky cells are not rejected; the map enters the
+# cost as the terrain penalty mppi_weight_Travmap * mean(1/safe_v + 1/safe_w)
+# over the horizon, so risky ground is routed around rather than only penalized
+# when a command exceeds its limits. That inverse-limit term is ~1.5 on fully
+# free terrain (2.0 m/s, 1.0 rad/s), ~3.0 at the default safe command (1.0,
+# 0.5), ~10 where the map falls to a third of it, and saturates at 200 on a
+# toorisky (0.01) cell. The weight below is sized so a 3x terrain degradation
+# outbids the path/heading/rate cost of a ~0.4 m detour, while a toorisky cell
+# stays effectively impassable. CAUTION: the term no longer depends on the
+# command, so the map alone does not slow the robot down any more.
+mppi_weight_PathTracking: 600.0
+mppi_weight_PathAligned: 50.0
+mppi_weight_PathTracking_Terminal: 60.0
+mppi_weight_Progress: 50
+mppi_weight_CtrlEffort: 0.001
+mppi_weight_Accel: 0.1
+mppi_weight_Travmap: 15.0
+# Per-metre terrain share: (1/safe_v + 1/safe_w - free baseline) per conservative_speed_v*mppi_dt driven.
+# Keep Travmap + TravmapDistance = 30 (barrier unchanged); Travmap >= 30*3/7 so spinning in a stamp never beats leaving it.
+mppi_weight_TravmapDistance: 15.0
+# Power-mean ORDER p of the footprint reduction the terrain cost is built on. -1.0 is the
+# harmonic mean (the historical behaviour), 0.0 the geometric mean; must be <= 0. Both ENDS of
+# the reduction are pinned at every p -- an all-free footprint and an all-blocked one cost the
+# same as they do at -1.0 -- so this relaxes what a footprint GRAZING an obstacle edge pays
+# WITHOUT lowering the all-blocked barrier, which mppi_weight_Travmap and toorisky_v/w can only
+# move together. At weight 20, toorisky 0.01 and 9 footprint points, n blocked points cost
+# (graze figures are the n=1 cost expressed as an equivalent cross-track at PathTracking 600):
+#   p=-1.00: n=1 471, n=2 912, n=5 2235, n=9 4000   graze ~ 0.86 m
+#   p=-0.80: n=1 308, n=2 664, n=5 1957, n=9 4000   graze ~ 0.68 m   <- in use
+#   p=-0.75: n=1 273, n=2 602, n=5 1876, n=9 4000   graze ~ 0.64 m
+#   p=-0.50: n=1 140, n=2 334, n=5 1410, n=9 4000   graze ~ 0.43 m
+#   p= 0.00: n=1  51, n=2  88, n=5  451, n=9 4000   graze ~ 0.19 m
+# Only the terrain COST reads this: the command rectangle samples the body centre alone, and a
+# power mean over one point is that point at every order, so the command domain and the
+# MapUsable veto are unaffected. A POSITIVE order is rejected by MPPIConfig.__post_init__ --
+# it leans the reduction toward the FREE points and would price a mostly-blocked footprint as
+# nearly free (at +0.5, five of nine blocked costs 121, a 0.45 m detour).
+mppi_travmap_footprint_harmonic_power: -1.5
 
 # Fixed-distance waypoint lookahead (m) used by GlobalMap.get_waypoint.
 waypoint_lookahead_distance: 2.0
+# Multiplier on the horizon span (mppi_horizon * mppi_dt) used to query the local
+# reference's lookahead waypoint. 1.0 puts the waypoint exactly where the last rollout knot
+# can reach, leaving the plan nothing to steer toward past its own endpoint; above 1.0 the
+# waypoint stays ahead of the rollout. Scales the TIME, so the reach still follows the
+# command ceiling: 1.5 * 7 * 0.5 s = 5.25 s -> 7.9 m at maximum_cmd_v, 2.6 m at the
+# conservative speed.
+mppi_lookahead_time_scale: 1.0
 
 
 ####################### Navigation FSM (statenav_fsm) #######################
@@ -203,3 +371,26 @@ radius_obs_affected_in_travmap: 0.2
 obstacle_interaction_distance_threshold: 0.5
 interaction_time_limit: 10.0
 fsm_transition_tag_duration: 1.0  # (s) how long FSMNode holds the WP_TRACKING_SUCCESS tag after success
+
+# ── Stall boost (main_mppi.py: _update_stall_boost, wp_tracking) ──
+# In a too-risky cell MPPI's command is capped at the conservative floors (0.5 m/s, 0.6 rad/s). The
+# locomotion policy can refuse to follow such a slow command, so the robot sits still while MPPI
+# re-issues the same command every tick because the state never changes.
+# A stall = the published command asks for motion on at least one axis and EVERY axis it asks for
+# stays unrealized for stall_time. While it lasts, conservative_speed_v/w are raised to
+# stall_boost_v/w; they return to nominal once the robot has translated stall_release_dist, the
+# command no longer asks for motion, or the FSM mode changes. The boost only changes cells whose
+# limit sits below the boosted floor; the ENGAGED log prints the knot-0 limits so that can be checked.
+# Invalid combinations abort the local planner at startup with the reason.
+stall_boost_enable: true
+stall_time: 1.5          # s — stall must persist this long (> mppi_lag_time + ma_window_s)
+stall_cmd_v_min: 0.2     # m/s — published |v| at least this = linear axis commanded; <= conservative_speed_v
+stall_cmd_w_min: 0.4     # rad/s — published |w| at least this = angular axis commanded; <= conservative_speed_w
+stall_meas_v_max: 0.1    # m/s — measured |avg_v| below this counts as "not translating"; < stall_cmd_v_min
+stall_meas_w_max: 0.1    # rad/s — measured |avg_w| below this counts as "not turning"; < stall_cmd_w_min
+stall_boost_v: 1.0       # m/s — conservative_speed_v while boosted; in [conservative_speed_v, maximum_cmd_v]
+stall_boost_w: 1.0       # rad/s — conservative_speed_w while boosted; in [conservative_speed_w, maximum_cmd_w]
+stall_release_dist: 0.3  # m — robot translation since engage that ends the boost (a pivot never releases this way)
+# Linear-domain scale for reversed_geometry (reverse-driving) rollouts; inert in this release,
+# kept because MPPIConfig requires it.
+mppi_recovery_reverse_scale: 1.0

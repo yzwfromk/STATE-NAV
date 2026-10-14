@@ -18,7 +18,8 @@ from statenav_fsm.qos_profiles import (
     qos_profile_level2,
     qos_profile_level3,
 )
-cfg = OmegaConf.load(PathLib(statenav_global.__file__).parent / "configs/planning_config.yaml")
+from statenav_global.core.config import load_planning_config
+cfg = load_planning_config()   # $STATENAV_PLANNING_CONFIG, else the packaged planning_config.yaml
 
 from statenav_fsm.NavigationFSM import NavigationFSM, FSMState
 

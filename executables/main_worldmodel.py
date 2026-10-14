@@ -20,7 +20,7 @@ if not os.path.exists('/etc/nv_tegra_release'):
 import statenav_global
 from statenav_global.world_model import *
 import statenav_global.world_model.WorldModel as WorldModel
-from statenav_global.utility.ros_utils import publish_costmap_float32multiarray, publish_costmap_gridmap, Rviz_vis_graph, Rviz_vis_travmap
+from statenav_global.ros.ros_utils import Rviz_vis_graph
 # Shared QoS ladder — single source of truth for the wire contract across statenav.
 from statenav_fsm.qos_profiles import (
     qos_profile_level2,
@@ -36,7 +36,7 @@ import rclpy.parameter
 from rclpy.node import Node
 from rclpy.clock import ClockType
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Float32MultiArray, Bool, String
+from std_msgs.msg import Bool, String
 from grid_map_msgs.msg import GridMap
 from visualization_msgs.msg import MarkerArray
 
@@ -46,7 +46,8 @@ import threading
 import warnings
 warnings.simplefilter(action='ignore', category=RuntimeWarning)
 
-cfg = OmegaConf.load(PathLib(statenav_global.__file__).parent / "configs/planning_config.yaml")
+from statenav_global.core.config import load_planning_config, planning_config_path
+cfg = load_planning_config()   # $STATENAV_PLANNING_CONFIG, else the packaged planning_config.yaml
 
 
 class WorldModelNode(SimTimeLoggerMixin, Node):
@@ -58,9 +59,9 @@ class WorldModelNode(SimTimeLoggerMixin, Node):
     - Planner runs in SEPARATE process (reader) - reads maps from shared memory
     - Communication: Shared memory (maps) + ROS topics (coordination)
 
-    Can run in two modes:
-    1. Named shared memory: use_shared_memory=True (multiprocess, maps visible to Planner)
-    2. No shared memory: use_shared_memory=False (single process, publishes /global_costmap)
+    Runs only with named shared memory (use_shared_memory=True): traversability lives in the
+    shared lattice graph, which the planner and the MPPI read directly. The former
+    use_shared_memory=False mode (dense /global_costmap over ROS) was removed with the dense map.
     """
 
     def __init__(self, use_shared_memory=None, use_sim_time: bool = False):
@@ -81,7 +82,7 @@ class WorldModelNode(SimTimeLoggerMixin, Node):
 
         os.nice(-10)
 
-        cfg_path = PathLib(statenav_global.__file__).parent / "configs/planning_config.yaml"
+        cfg_path = planning_config_path()   # same resolution as the library modules (core.config)
         self.cfg_path = cfg_path  # advertised over ROS so planner/logging load the same config
         self.cfg = OmegaConf.load(cfg_path)
 
@@ -102,6 +103,13 @@ class WorldModelNode(SimTimeLoggerMixin, Node):
         self.use_shared_memory = use_shared_memory if use_shared_memory is not None else (
             self.cfg.get('use_shared_memory', False)
         )
+        # Guard: the shared graph (the only traversability store) needs shared memory; the
+        # ROS-message mode that published a dense /global_costmap no longer exists.
+        if not self.use_shared_memory:
+            raise RuntimeError(
+                f"[WorldModel] use_shared_memory={self.use_shared_memory!r} in {cfg_path}, but only "
+                f"shared-memory mode is supported: traversability lives only in the shared graph "
+                f"(the dense /global_costmap mode was removed). Set use_shared_memory: True.")
 
         self.current_fsm_state = "WP_TRACKING"
 
@@ -131,13 +139,9 @@ class WorldModelNode(SimTimeLoggerMixin, Node):
 
     def _init_map_and_worldmodel(self):
         """Initialize map and world model based on shared memory mode."""
-        if self.use_shared_memory:
-            self.get_logger().info("[WorldModel] Initializing WorldModel with shared memory (named)")
-            self.world_model = WorldModel.WorldModel(use_shared_memory=True)
-        else:
-            self.get_logger().info("[WorldModel] Initializing map without shared memory (direct creation)")
-            self.world_model = WorldModel.WorldModel(use_shared_memory=False)
-            # Map is created by WorldModel.create_map_from_config() in __init__
+        # Shared memory only (guarded in __init__).
+        self.get_logger().info("[WorldModel] Initializing WorldModel with shared memory (named)")
+        self.world_model = WorldModel.WorldModel(use_shared_memory=True)
 
     def _setup_ros_communication(self):
         """Setup ROS2 subscribers and publishers.
@@ -168,26 +172,16 @@ class WorldModelNode(SimTimeLoggerMixin, Node):
         self.get_logger().info(f"[WorldModel] Advertised planning_config path on /planning_config_path: {self.cfg_path}")
 
 
-        self.use_gridmap_msg = self.cfg.get('use_gridmap_msg', False)
         self.frame_id = self.cfg.frame_id
 
-        if not self.use_shared_memory:
-            msg_type = GridMap if self.use_gridmap_msg else Float32MultiArray
-            self.global_costmap_pub = self.create_publisher(msg_type, "/global_costmap", qos_profile_level2)
-            self.get_logger().info(f"[WorldModel] Using {'GridMap' if self.use_gridmap_msg else 'Float32MultiArray'} for costmap publishing")
-
-        # Optional Rviz2 visualization: elevation map colored by north-direction cmd_v.
-        # Enabled for every planner EXCEPT Astar: only Astar builds the shared-memory graph
-        # that /graph_visualization draws, so for every other planner the dense travmap is the
-        # only observable map view.
+        # Optional Rviz2 visualization of the shared traversability graph (nodes + edges).
+        # Switched by the existing pub_travmap_visualization key (its dense /travmap_visualization
+        # GridMap was removed with the dense map) and, as before, always on for non-Astar planners.
         astar_active = str(self.cfg.get('global_planner_type', 'Astar')).lower() == 'astar'
         if self.cfg.get('pub_travmap_visualization', False) or not astar_active:
-            self.travmap_vis_pub = self.create_publisher(GridMap, "/travmap_visualization", qos_profile_level2)
             self.graph_vis_pub = self.create_publisher(MarkerArray, "/graph_visualization", qos_profile_level2)
-            self.get_logger().info("[WorldModel] Publishing travmap visualization on /travmap_visualization (elevation + cmd_v @ north, 0.5 Hz)")
-            self.get_logger().info("[WorldModel] Publishing graph visualization on /graph_visualization with the travmap visualization schedule")
+            self.get_logger().info("[WorldModel] Publishing graph visualization on /graph_visualization")
         else:
-            self.travmap_vis_pub = None
             self.graph_vis_pub = None
 
 
@@ -213,14 +207,6 @@ class WorldModelNode(SimTimeLoggerMixin, Node):
 
 
 ####################################### PUBLISH #######################################
-
-    def _publish_costmap(self):
-        """Publish full costmap (non-shared-memory mode only)."""
-        publish_func = publish_costmap_gridmap if self.use_gridmap_msg else publish_costmap_float32multiarray
-        publish_func(
-            self.world_model.global_map, self.frame_id, self.global_costmap_pub,
-            node=self
-        )
 
     def _handle_replanning_signals(self, current_time):
         """Publish replanning signal when WorldModel requests a replan.
@@ -338,13 +324,12 @@ class WorldModelNode(SimTimeLoggerMixin, Node):
                 return
 
         # Guard the construction invariant explicitly. CMDbasedMapWithBackend.Initilize_map()
-        # builds the graph before it lets the traversability map become ready, so reaching this
-        # state without a writer means startup is inconsistent.
-        graph_required = (self.use_shared_memory
-                          and str(self.cfg.get('global_planner_type', 'Astar')) == "Astar")
-        if graph_required and self.world_model.global_map.graph_writer is None:
+        # builds the graph (every planner type: it is the only traversability store) before it
+        # lets the traversability map become ready, so reaching this state without a writer
+        # means startup is inconsistent.
+        if self.world_model.global_map.graph_writer is None:
             raise RuntimeError(
-                "[WorldModel] Traversability map is built but the required Astar shared graph "
+                "[WorldModel] Traversability map is built but the required shared graph "
                 "writer is missing.")
 
         # The startup tick already updated once to create the map/graph and must not
@@ -353,25 +338,14 @@ class WorldModelNode(SimTimeLoggerMixin, Node):
             self._update_map()
 
         if self.world_model.global_map.is_TraversabilityMap_built:
-            if not self.use_shared_memory:
-                self._publish_costmap()
-
-            # Publish Rviz2 elevation+travmap visualization at max 0.5 Hz
-            if self.travmap_vis_pub is not None:
-                # if current_time - self.last_travmap_vis_pub_time >= self.travmap_vis_pub_interval:
-                
-                if (self.graph_vis_pub is not None
-                    and self.world_model.global_map.graph_writer is not None):
-                    Rviz_vis_graph(
-                        self.world_model.global_map,
-                        self.graph_vis_pub,
-                        self,
-                        self.frame_id,
-                    )
-                else:
-                    Rviz_vis_travmap(self.world_model.global_map, self.travmap_vis_pub, self, self.frame_id)
-                
-                    # self.last_travmap_vis_pub_time = current_time
+            # Publish Rviz2 graph visualization
+            if self.graph_vis_pub is not None:
+                Rviz_vis_graph(
+                    self.world_model.global_map,
+                    self.graph_vis_pub,
+                    self,
+                    self.frame_id,
+                )
 
 
         # Request a replan only when the map/graph actually changed enough to affect the plan

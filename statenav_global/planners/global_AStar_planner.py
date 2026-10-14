@@ -173,7 +173,7 @@ class GlobalAStar(BasePlanner):
         # truth for writer + reader). Imported lazily to keep this module free
         # of the heavy world-model import chain at package-load time.
         if graph_layout is None:
-            from statenav_global.world_model.globalmap import GRAPH_LAYOUT
+            from statenav_global.core.graph_layout import GRAPH_LAYOUT
             graph_layout = GRAPH_LAYOUT
         self.graph_layout = graph_layout
         # One SharedGraphReader (created lazily on first plan unless injected)
@@ -287,7 +287,7 @@ class GlobalAStar(BasePlanner):
             return
         # Lazy import (see module docstring): avoids the heavy world-model
         # import chain at package-load time.
-        from statenav_global.world_model.shared_graph import (
+        from statenav_global.core.shared_graph import (
             SharedGraphReader, SharedGraphError,
         )
         try:
@@ -298,7 +298,7 @@ class GlobalAStar(BasePlanner):
             # not an ordinary no-path result (design 19).
             raise RuntimeError(
                 f"GlobalAStar: could not attach to the shared graph — is the "
-                f"world-model writer running with global_planner_type == 'Astar'? "
+                f"world-model writer running (it builds the graph at map init)? "
                 f"({exc})") from exc
 
     def close(self):
@@ -887,10 +887,10 @@ class GlobalAStar(BasePlanner):
             return None
         return math.atan2(ty, tx)
 
-    def _compute_start(self, initial_start, total_lookahead_time, forced_start):
+    def _compute_start(self, initial_start, total_lookahead_time):
         """
         Resolve the planning start pose (sx, sy, sh) without mutating any
-        planner state. Applies a 3-branch priority (forced_start > waypoint
+        planner state. Applies a 2-branch priority (waypoint
         lookahead > current robot pose) over the A* tuple endpoints
         (self.x_start / self.x_goal).
 
@@ -898,24 +898,6 @@ class GlobalAStar(BasePlanner):
         Returns:
             (sx, sy, sh): planning start x, y (world coords) and heading (rad).
         """
-        # --- Branch 1: forced start ---------------------------------------
-        # Heading points from the robot toward the forced start; fall back to
-        # the robot heading if coincident.
-        if forced_start is not None:
-            sx, sy = float(forced_start[0]), float(forced_start[1])
-            dx = sx - self.global_map.robot_x
-            dy = sy - self.global_map.robot_y
-            if abs(dx) > 1e-3 or abs(dy) > 1e-3:
-                sh = math.atan2(dy, dx)
-            else:
-                sh = float(self.global_map.robot_heading)
-            return sx, sy, sh
-
-        # --- Branch 2: waypoint lookahead along the last path -------------
-        # Project a point (scaled) reachable_radius ahead of the robot on
-        # self.path so the plan starts roughly where the robot will be once
-        # planning finishes. get_waypoint returns False when self.path is empty.
-        [cmd_v_limit, cmd_w_limit] = self.global_map.get_cmd_limits()
         # Graph node spacing (m). Every threshold below is scaled by it, so an
         # absent / invalid value must fail loud rather than silently disable the
         # guards. Set by CMDbasedMap.__init__ from cfg.trav_estimation_resoultion
@@ -926,10 +908,16 @@ class GlobalAStar(BasePlanner):
                 f"GlobalAStar._compute_start: global_map.TravUpdate_XYResolution "
                 f"must be a positive finite graph spacing, got {lattice_R!r}")
         lattice_R = float(lattice_R)
+
+        # --- Branch 1: waypoint lookahead along the last path -------------
+        # Project a point (scaled) reachable_radius ahead of the robot on
+        # self.path so the plan starts roughly where the robot will be once
+        # planning finishes. get_waypoint returns False when self.path is empty.
+        [cmd_v_limit, cmd_w_limit] = self.global_map.get_cmd_limits()
         # Effective lookahead DISTANCE (m), floored at _LOOKAHEAD_MIN_CELLS cells.
         # get_waypoint's reachable radius is total_lookahead_time * cmd_v_limit,
         # so passing the distance with cmd_v_limit pinned to 1.0 makes the radius
-        # exactly this value (the same call convention main.py::_select_waypoint uses).
+        # exactly this value.
         lookahead_dist = max(float(total_lookahead_time) * float(cmd_v_limit),
                              self._LOOKAHEAD_MIN_CELLS * lattice_R)
         waypoint = self.global_map.get_waypoint(
@@ -980,7 +968,7 @@ class GlobalAStar(BasePlanner):
                   f"{goal_gap:.3f} m, moved_off_initial {moved_off_initial}); "
                   f"starting from the robot pose.")
 
-        # --- Branch 3: current robot pose (fallback) ----------------------
+        # --- Branch 2: current robot pose (fallback) ----------------------
         return (float(self.global_map.robot_x),
                 float(self.global_map.robot_y),
                 float(self.global_map.robot_heading))
@@ -990,10 +978,10 @@ class GlobalAStar(BasePlanner):
     # ------------------------------------------------------------------
 
     def replan(self, initial_start=None, total_lookahead_time=0.5,
-               plot_map=False, forced_start=None):
+               plot_map=False):
         """
-        Node-facing replan wrapper. Determines the planning start pose (forced
-        start > current robot pose), keeps the fixed global goal, runs the graph
+        Node-facing replan wrapper. Determines the planning start pose (waypoint
+        lookahead > current robot pose), keeps the fixed global goal, runs the graph
         A*, and logs timing/diagnostics.
         """
         if self.global_map is None:
@@ -1005,13 +993,11 @@ class GlobalAStar(BasePlanner):
         start_time = time.time()
         print("\nReplanning Global Path (A* on shared graph)!")
 
-        # --- select the planning start (forced > waypoint lookahead > robot pose) -
-        # Shared 3-branch selection (see _compute_start). initial_start is threaded
+        # --- select the planning start (waypoint lookahead > robot pose) -
+        # Shared 2-branch selection (see _compute_start). initial_start is threaded
         # through so the lookahead's "robot has moved off the config start" guard
         # can fire; the executable already passes it to replan().
-        sx, sy, sh = self._compute_start(initial_start, total_lookahead_time, forced_start)
-        if forced_start is not None:
-            print(f" [ForcedStart] ({sx:.3f}, {sy:.3f}), heading {np.rad2deg(sh):.1f} deg")
+        sx, sy, sh = self._compute_start(initial_start, total_lookahead_time)
 
         gx, gy = self.x_goal
         self.x_start = (sx, sy)
@@ -1026,9 +1012,7 @@ class GlobalAStar(BasePlanner):
         # graph (map boundary / hole) or land on a disconnected pocket while the
         # robot's own pose is still plannable. plan() has already cleared
         # self.path, so without this retry the whole cycle publishes nothing.
-        # Skipped for a forced start: that is an explicit caller decision
-        # and must not be silently overridden.
-        if (not success) and forced_start is None:
+        if not success:
             rx = float(self.global_map.robot_x)
             ry = float(self.global_map.robot_y)
             rh = float(self.global_map.robot_heading)

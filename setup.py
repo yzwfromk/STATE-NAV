@@ -49,7 +49,21 @@ readme_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "README.
 readme = open(readme_path).read() if os.path.exists(readme_path) else ""
 version = find_version("statenav_global", "__init__.py")
 
-install_requires = _load_requirements(os.path.dirname(os.path.realpath(__file__)))
+# Base install = the numpy-level contract layer (statenav_global.core). Every module is opt-in via
+# an extra, e.g. `pip install -e .[worldmodel]`. requirements.txt
+# stays the full Docker image list (docker/startup.sh installs it explicitly before this package).
+# torch / torchvision are left unpinned: install the CUDA (or CPU) build for your platform first,
+# then pip keeps it. Tested versions of everything else: constraints.txt (pip install -c ...).
+install_requires = ["numpy<2", "omegaconf"]
+_WORLDMODEL_REQUIRES = ["torch", "torchvision", "scipy", "matplotlib", "hydra-core>=1.1", "transforms3d"]
+extras_require = {
+    "worldmodel": _WORLDMODEL_REQUIRES,                     # statenav_global.world_model / utility / inference
+    "planners": _WORLDMODEL_REQUIRES + ["pillow"],          # statenav_global.planners (A*)
+    "mppi": ["torch"],                                      # statenav_mppi (MPPI local planner)
+    "dev": ["isort", "black", "pyright"],
+    "test": ["pytest"],
+}
+extras_require["all"] = sorted(set(sum((extras_require[k] for k in ("worldmodel", "planners", "mppi")), [])))
 
 setup(
     name="statenav_global",
@@ -75,14 +89,12 @@ setup(
             'main_fsm = executables.main_fsm:main',
             'main_global_planning = executables.main_global_planning:main',
             'main_multiprocess = executables.main_multiprocess:main',
+            'main_mppi = executables.main_mppi:main',
         ],
     },
     python_requires=">=3.8",
     install_requires=install_requires,
-    extras_require={
-        "dev": ["isort", "black", "pyright"],
-        "test": ["pytest"],
-    },
+    extras_require=extras_require,
     license="MIT",
     zip_safe=True,
     classifiers=[

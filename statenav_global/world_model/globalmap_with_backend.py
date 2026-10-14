@@ -71,7 +71,7 @@ class CMDbasedMapWithBackend(CMDbasedMap):
     def _cleanup_handler(self):
         """Cleanup handler for atexit/ROS shutdown"""
         # Close the shared graph first (owned by the writer-side map); harmless
-        # no-op when no graph was built (non-"Astar" planner types).
+        # no-op when no graph was built yet (shutdown before Initilize_map).
         try:
             self._close_shared_graph()
         except Exception:
@@ -113,23 +113,20 @@ class CMDbasedMapWithBackend(CMDbasedMap):
                 elev_map_ymax=self.map_ymax
             )
             
-            # Get arrays from backend (these point to shared memory if using it)
-            self.TraversabilityMap = self.backend.get_traversability_map()
+            # Get arrays from backend (these point to shared memory if using it).
+            # Elevation only: traversability lives in the shared graph built below.
             self.ElevationMap = self.backend.get_elevation_map()
             self.ElevMap_MetaInfo = self.backend.get_elev_meta_info()
-            self.TravMap_MetaInfo = self.backend.get_trav_meta_info()
-            
-            # Initialize the neutral interior and the non-inferable too-risky border.
-            self._initialize_traversability_map_values()
 
             # The initial fill IS map content, so the version leaves initialization at
             # >= 1: a reader can then tell "map written" from the 0 of a fresh block.
             self.bump_map_version()
 
             # Build the lattice-aligned shared graph now that coarse-lattice
-            # geometry is known (writer side, only when global_planner_type ==
-            # "Astar"; a no-op otherwise). CMDbasedMap._build_shared_graph owns
-            # all graph logic and imports; this is only the construction hook.
+            # geometry is known (writer side, every planner type). Its creation seeds
+            # the neutral interior and the non-inferable too-risky border.
+            # CMDbasedMap._build_shared_graph owns all graph logic and imports; this
+            # is only the construction hook.
             self._build_shared_graph()
 
     
@@ -214,12 +211,11 @@ class CMDbasedMapReaderProxy(CMDbasedMap):
         if rospy is not None:
             rospy.on_shutdown(self._cleanup_handler)
         
-        # Override arrays with shared memory arrays
-        self.TraversabilityMap = backend.get_traversability_map()
+        # Override arrays with shared memory arrays (elevation only; traversability is
+        # read from the shared graph through graph_cmd_at / the planner's own reader).
         self.ElevationMap = backend.get_elevation_map()
         self.ElevMap_MetaInfo = backend.get_elev_meta_info()
-        self.TravMap_MetaInfo = backend.get_trav_meta_info()
-        
+
         # Set map parameters from backend metadata
         self.map_resolution = backend.get_map_resolution()
         bounds = backend.get_map_bounds()
@@ -237,24 +233,16 @@ class CMDbasedMapReaderProxy(CMDbasedMap):
         # Size attributes for consistency (calculated from bounds)
         self.map_size_x = self.map_xmax - self.map_xmin
         self.map_size_y = self.map_ymax - self.map_ymin
-        
-        self.TravMap_MetaInfo_size_layers = dims['trav_map_layers']
-        
+
         # Map parameters (same as CMDbasedMap)
         self.TraversabilityMap_theta_min = -np.pi
         self.TraversabilityMap_theta_resolution = np.pi / 4
         self.TraversabilityMap_theta_max = np.pi - self.TraversabilityMap_theta_resolution
-        
-        # TravMap_MetaInfo theta parameters
-        self.TravMap_MetaInfo_theta_min = self.TraversabilityMap_theta_min
-        self.TravMap_MetaInfo_theta_resolution = self.TraversabilityMap_theta_resolution
-        self.TravMap_MetaInfo_theta_max = self.TraversabilityMap_theta_max
-        
+
         # is_TraversabilityMap_built / is_ElevationMap_built
         # are defined as properties below — they always read live from the backend.
         # No snapshot assignments here; the parent's __init__ writes are absorbed by no-op setters.
         self.is_ElevMap_MetaInfo_built = True  # MetaInfo arrays are available from shared memory
-        self.is_TravMap_MetaInfo_built = True
     
     # ── Live-read properties: always reflect current backend state ───────────
     # The parent's __init__ writes False to these; the no-op setters absorb those
@@ -301,15 +289,11 @@ class CMDbasedMapReaderProxy(CMDbasedMap):
                 
                 # TODO: Why?
                 try:
-                    test_shm_trav = shared_memory.SharedMemory(name='trav_map_shm')
                     test_shm_elev = shared_memory.SharedMemory(name='elev_map_shm')
                     test_shm_elev_meta = shared_memory.SharedMemory(name='elev_meta_shm')
-                    test_shm_trav_meta = shared_memory.SharedMemory(name='trav_meta_shm')
                     # Close test connections
-                    test_shm_trav.close()
                     test_shm_elev.close()
                     test_shm_elev_meta.close()
-                    test_shm_trav_meta.close()
                     
                     # All shared memory blocks exist, now initialize arrays (this will attach properly)
                     bounds = self.backend.get_map_bounds()
@@ -369,13 +353,19 @@ class CMDbasedMapReaderProxy(CMDbasedMap):
     
     def _cleanup_handler(self):
         """Cleanup handler for atexit/ROS shutdown"""
+        # Close graph_cmd_at's reader handles (a reader never owns or unlinks the graph).
+        try:
+            self._close_shared_graph()
+        except Exception:
+            pass  # Ignore errors during shutdown
         if hasattr(self, 'backend'):
             try:
                 self.backend.cleanup()
             except Exception:
                 pass  # Ignore errors during shutdown
-    
+
     def cleanup(self):
         """Explicit cleanup (also called automatically on shutdown)"""
+        self._close_shared_graph()
         self.backend.cleanup()
 

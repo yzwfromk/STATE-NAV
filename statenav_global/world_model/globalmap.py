@@ -31,9 +31,9 @@ from statenav_global.utility.plotting import (
     PLOT_DPI, PLOT_FORMAT, FONT_PROP, BaseFigure, MapFigure
 )
 # Shared-memory graph backend (Part 1a/1b). Only the writer-side symbols used by
-# the Part 2 grid-topology integration are imported here; the layout below is the
-# single definition writer and reader (planner) must both import.
-from statenav_global.world_model.shared_graph import (
+# the Part 2 grid-topology integration are imported here; the layout (core.graph_layout,
+# re-exported below) is the single definition writer and reader (planner) must both import.
+from statenav_global.core.shared_graph import (
     GraphLayout, SharedGraphWriter, SharedGraphError,
 )
 
@@ -41,12 +41,9 @@ from statenav_global.world_model.shared_graph import (
 
 
 
-from std_msgs.msg import Float32MultiArray
-from grid_map_msgs.msg import GridMap
-from geometry_msgs.msg import PoseStamped
-
-
-import tf_transformations as tf_trans
+# No ROS imports here: this module must import without a ROS environment. The ROS-facing
+# callbacks (pose_callback, robo_centric_map_callback) read their messages by attribute only,
+# and quaternion -> Euler uses transforms3d (bit-identical to tf_transformations' sxyz path).
 import transforms3d as tf3
 from scipy.ndimage import map_coordinates
 import warnings
@@ -57,7 +54,8 @@ warnings.simplefilter(action='ignore', category=RuntimeWarning)
 
 from pathlib import Path
 _PKG_ROOT = Path(__file__).resolve().parent.parent
-cfg = OmegaConf.load(_PKG_ROOT / "configs/planning_config.yaml")
+from statenav_global.core.config import load_planning_config
+cfg = load_planning_config()   # $STATENAV_PLANNING_CONFIG, else the packaged planning_config.yaml
 
 
     
@@ -90,52 +88,13 @@ class ElevmapInfo_IntEnum(IntEnum):
     ELEV_NotInitialized = 0
     ELEV_MEASURED = 1
 
-class TravmapInfo_IntEnum(IntEnum):
-
-    TRAV_NotInitialized = 0
-    TRAV_NEEDUPDATE = 1
-    TRAV_Estimated = 2
-
-
-# ---------------------------------------------------------------------------
-# Shared-memory graph payload layout (Part 2)
-# ---------------------------------------------------------------------------
-# One module-level layout imported identically by the writer (this world model)
-# and the reader (planner, Part 3). Do NOT reconstruct an equivalent dict at
-# other call sites.
-#
-# The fresh-node command defaults are bound to the exact values the existing
-# `Initilize_map` writes into TraversabilityMap on initialization
-# (TraversabilityMap[:,:,:,0] = InitialGuess_cmd_v, [:,:,:,1] = InitialGuess_cmd_w),
-# which are cfg.default_safe_cmd_v / cfg.default_safe_cmd_w. They are read from
-# the same config source rather than duplicated as literals, so a fresh graph
-# node's 8 cmd layers match the map's Initialguess state exactly. `meta` defaults
-# to TRAV_NotInitialized on every layer, matching the initial TravMap_MetaInfo.
-INITIAL_CMD_V_DEFAULT = float(cfg.default_safe_cmd_v)   # scalar broadcast over 8 heading layers
-INITIAL_CMD_W_DEFAULT = float(cfg.default_safe_cmd_w)   # scalar broadcast over 8 heading layers
-
-# Number of heading layers the graph payloads carry. The graph layout is a fixed
-# module constant, so it hard-codes the 8-layer heading discretization
-# (theta_min = -pi, theta_resolution = pi/4). _build_shared_graph guards that the
-# live map instance actually uses this many layers before constructing the graph.
-_GRAPH_HEADING_LAYERS = 8
-
-# Node payloads mirror TraversabilityMap cmd_v/cmd_w (float32, one value per
-# heading layer) and TravMap_MetaInfo (per-layer TravmapInfo_IntEnum status).
-# Edge payloads are empty: edges carry only generic graph-core data (immutable
-# geometric length); heading-aware traversal cost is derived planner-side in
-# Part 3, never stored on edges.
-GRAPH_LAYOUT = GraphLayout(
-    node_payloads={
-        "cmd_v": ((_GRAPH_HEADING_LAYERS,), np.float32, INITIAL_CMD_V_DEFAULT),
-        "cmd_w": ((_GRAPH_HEADING_LAYERS,), np.float32, INITIAL_CMD_W_DEFAULT),
-        "meta": (
-            (_GRAPH_HEADING_LAYERS,),
-            np.uint8,
-            int(TravmapInfo_IntEnum.TRAV_NotInitialized),
-        ),
-    },
-    edge_payloads={},
+# The graph payload contract (TravmapInfo_IntEnum, GRAPH_LAYOUT and its heading-layer
+# count / fresh-node cmd defaults) moved to statenav_global.core.graph_layout so readers
+# (GlobalAStar, MPPI) can import it without this module's torch / ROS stack. Re-exported
+# here so existing `from ...globalmap import GRAPH_LAYOUT` style imports keep working.
+from statenav_global.core.graph_layout import (
+    TravmapInfo_IntEnum, INITIAL_CMD_V_DEFAULT, INITIAL_CMD_W_DEFAULT,
+    _GRAPH_HEADING_LAYERS, GRAPH_LAYOUT,
 )
 
 
@@ -209,9 +168,10 @@ class BaseMap:
         self.which_layer = which_layer
 
 
-        # 3D (x,y,theta(=heading angle)) Traversability map that contains the pre-estimated cmd v and w. World frame
+        # 3D (x,y,theta(=heading angle)) traversability (pre-estimated cmd v and w, world frame) lives
+        # ONLY in the shared lattice graph (graph_writer); there is no dense grid. These attributes keep
+        # their legacy names: the readiness flag and the heading-layer geometry of the graph payloads.
         self.is_TraversabilityMap_built = False
-        self.TraversabilityMap = None
         self.TraversabilityMap_theta_min = -np.pi
         self.TraversabilityMap_theta_resolution = np.pi/4 # Do not change. 
         self.TraversabilityMap_theta_max = np.pi - self.TraversabilityMap_theta_resolution
@@ -263,14 +223,8 @@ class BaseMap:
         self.is_ElevMap_MetaInfo_built = False
         self.ElevMap_MetaInfo = None
 
+        # Per-layer traversability status values; stored in the graph's "meta" node payload.
         self.TravmapInfo_IntEnum = TravmapInfo_IntEnum
-        self.is_TravMap_MetaInfo_built = False
-        self.TravMap_MetaInfo = None
-        
-        self.TravMap_MetaInfo_theta_min = self.TraversabilityMap_theta_min
-        self.TravMap_MetaInfo_theta_resolution = self.TraversabilityMap_theta_resolution
-        self.TravMap_MetaInfo_theta_max = self.TraversabilityMap_theta_max
-        self.TravMap_MetaInfo_size_layers = self.TraversabilityMap_size_layers
 
 
 
@@ -280,10 +234,6 @@ class BaseMap:
         self.viz_vmax = self.maximum_cmd_v
         self.viz_title = "Traversability Map"
         self.viz_cbar_label = "Traversability Score"
-
-        # Pre-allocated flat float32 buffers for ros_utils.Rviz_vis_travmap (one per layer)
-        # Allocated in Initilize_map once map dimensions are known; shape: [num_rows * num_cols]
-        self._vis_flat_bufs = None
 
 
         # ML related
@@ -295,6 +245,12 @@ class BaseMap:
         # Travformer related
         self.local_patch_size = cfg.local_patch_size  # in meters
         self.elevonly_vw2instab_model = None
+        # Max elevation patches per TravFormer forward pass (bounds GPU memory, ~0.165 MB per patch).
+        # Rounded down to a multiple of 64, the batch granularity _compute_travmap pads to.
+        self.travformer_max_batch_patches = int(cfg.get('travformer_max_batch_patches', 30000)) // 64 * 64
+        if self.travformer_max_batch_patches < 64:
+            raise ValueError(f"planning_config.yaml: travformer_max_batch_patches must be >= 64, got "
+                             f"{cfg.get('travformer_max_batch_patches')}")
 
         def _load_model(checkpoint_path, model_type='Travformer', device='cpu'):
 
@@ -359,29 +315,6 @@ class BaseMap:
 
 
 
-    def _initialize_traversability_map_values(self):
-        """Initialize every traversability-map command with the neutral guess."""
-        if (self.TraversabilityMap is None or self.TraversabilityMap.ndim != 4
-                or self.TraversabilityMap.shape[3] != 4):
-            raise ValueError(
-                "_initialize_traversability_map_values requires TraversabilityMap "
-                f"shape (rows, cols, layers, 4), got "
-                f"{None if self.TraversabilityMap is None else self.TraversabilityMap.shape}")
-        expected_meta_shape = self.TraversabilityMap.shape[:3]
-        if self.TravMap_MetaInfo is None or self.TravMap_MetaInfo.shape != expected_meta_shape:
-            raise ValueError(
-                "_initialize_traversability_map_values requires TravMap_MetaInfo "
-                f"shape {expected_meta_shape}, got "
-                f"{None if self.TravMap_MetaInfo is None else self.TravMap_MetaInfo.shape}")
-
-        self.TraversabilityMap[:,:,:,0] = self.InitialGuess_cmd_v
-        self.TraversabilityMap[:,:,:,1] = self.InitialGuess_cmd_w
-        self.TraversabilityMap[:,:,:,2] = np.nan
-        self.TraversabilityMap[:,:,:,3] = np.nan
-        self.TravMap_MetaInfo[:] = TravmapInfo_IntEnum.TRAV_NotInitialized.value
-
-
-
 
 
 
@@ -393,13 +326,13 @@ class BaseMap:
 
     def bump_map_version(self):
         """
-        Publish "the dense map content changed" to the backend, ONCE per map-write
+        Publish "the map content changed" to the backend, ONCE per map-write
         transaction.
 
         The backend version counter is the only cross-process "map changed" signal
         (SharedMemoryBackend.increment_version / LocalMemoryBackend.increment_version),
-        so EVERY path that mutates ElevationMap / TraversabilityMap / ElevMap_MetaInfo /
-        TravMap_MetaInfo must call this once it has finished writing.
+        so EVERY path that mutates ElevationMap / ElevMap_MetaInfo or the shared graph's
+        traversability payloads must call this once it has finished writing.
 
         One bump per Update_map / Initilize_map.
 
@@ -426,14 +359,9 @@ class BaseMap:
 
             self.ElevationMap = np.full((self.map_size_rows, self.map_size_cols), np.nan)
 
-        # Build global trav map  (flag not initialized here though)
-        # 3D (x,y,theta(=heading angle)) global map that contains the pre-estimated cmd v and w array
-            self.TraversabilityMap = np.full((self.map_size_rows, self.map_size_cols, self.TraversabilityMap_size_layers, 4), np.nan)
-
-        # Build metainfo map
+        # Build metainfo map. Traversability has no dense grid: it lives only in the shared
+        # graph, which CMDbasedMapWithBackend.Initilize_map builds (_build_shared_graph).
             self.ElevMap_MetaInfo = np.full((self.map_size_rows, self.map_size_cols), ElevmapInfo_IntEnum.ELEV_NotInitialized.value)
-            self.TravMap_MetaInfo = np.full((self.map_size_rows, self.map_size_cols, self.TravMap_MetaInfo_size_layers), TravmapInfo_IntEnum.TRAV_NotInitialized.value)
-            self._initialize_traversability_map_values()
 
         
 
@@ -472,8 +400,10 @@ class BaseMap:
             H, W = local_map.shape
             # half_r / half_c: pixel offset from the local map's top-left corner to its center cell,
             # used to convert (row, col) indices into world-frame metric offsets
-            half_r = int(self.RobocentricMap_Rows / 2)
-            half_c = int(self.RobocentricMap_Cols / 2)
+            # grid_map cell centres (getPositionFromIndex): x(r) = center + ((H-1)/2 - r)*res. Taken from
+            # local_map's own (H, W): rows run along x, i.e. the transposed GridMap's length_x axis.
+            half_r = 0.5 * (H - 1)
+            half_c = 0.5 * (W - 1)
             R         = self.TravUpdate_XYResolution  # coarse grid resolution (m) used to quantise TravUpdate candidate positions
             half_patch = 0.5 * self.local_patch_size  # half the Travformer inference window (m); candidates closer to the map edge than this are skipped
             NINIT_T = self.TravmapInfo_IntEnum.TRAV_NotInitialized.value  # int sentinel: traversability not yet estimated for a direction
@@ -496,8 +426,12 @@ class BaseMap:
             global_y_all = (half_c - col_idx) * self.map_resolution + center_pos_snap[1]
 
             # row_global_all / col_global_all : (H, W) int – corresponding row/col in the global elevation map
-            row_global_all = ((self.map_xmax - global_x_all) / self.map_resolution).astype(int)
-            col_global_all = ((self.map_ymax - global_y_all) / self.map_resolution).astype(int)
+            # One rounding for the whole local grid (the global cell containing local cell (0, 0)'s centre),
+            # then integer offsets: a per-cell floor/truncation flips on cell boundaries and leaves holes.
+            r0 = int(np.round((self.map_xmax - global_x_all[0, 0]) / self.map_resolution - 0.5))
+            c0 = int(np.round((self.map_ymax - global_y_all[0, 0]) / self.map_resolution - 0.5))
+            row_global_all = r0 + row_idx
+            col_global_all = c0 + col_idx
 
             # ---------------------------------------------------------------
             # Step 2: Build a validity mask and flatten to per-valid-cell vectors.
@@ -563,8 +497,9 @@ class BaseMap:
             case_c = np.zeros(len(vgx), dtype=bool)
             if np.any(can_be_c):
                 # trav_any_uninit : (K,) bool – at least one heading direction has no traversability estimate
-                #   K = number of can_be_c cells; TravMap_MetaInfo[r,c] has shape (num_layers,) per cell
-                trav_any_uninit = np.any(self.TravMap_MetaInfo[vrg[can_be_c], vcg[can_be_c]] == NINIT_T, axis=-1)
+                #   K = number of can_be_c cells; each cell reads the (num_layers,) graph meta of the
+                #   lattice node whose R x R estimation cell contains it
+                trav_any_uninit = np.any(self._graph_node_rows(np.stack([vgx[can_be_c], vgy[can_be_c]], axis=1), 'meta', NINIT_T) == NINIT_T, axis=-1)
                 # rand_pass : (K,) bool – random gate so only ~RandomRate_TravUpdate fraction are probed
                 rand_pass = np.random.random(int(np.sum(can_be_c))) < self.RandomRate_TravUpdate
                 case_c[can_be_c] = trav_any_uninit & rand_pass
@@ -595,11 +530,13 @@ class BaseMap:
             def _floor_to_cands(gx, gy):
                 # gx, gy : (K,) float – world coords of triggering cells
                 # Returns (4*M, 2) float – 4 floor-grid neighbours for each of M unique floor points.
-                # np.arange(fx-R, fx+R, R) gives [fx-R, fx], so offsets span {-R, 0} × {-R, 0}.
+                # The corners of the R x R square CONTAINING the cell, {fx, fx+R} x {fy, fy+R}: the only
+                # lattice points whose +-local_patch_size/2 window (> R/2) can contain it. ({-R, 0}
+                # offsets queued the square on the -x/-y side, which never sees the cell, and missed fx+R.)
                 fx = R * np.floor(gx / R)
                 fy = R * np.floor(gy / R)
                 uniq = np.unique(np.stack([fx, fy], axis=1), axis=0)  # (M, 2) – deduplicated floor points
-                offsets = np.array([[-R, -R], [-R, 0.], [0., -R], [0., 0.]])  # (4, 2)
+                offsets = np.array([[0., 0.], [0., R], [R, 0.], [R, R]])  # (4, 2)
                 return (uniq[:, None, :] + offsets[None]).reshape(-1, 2)      # (4M, 2)
 
             def _base_filter(pts):
@@ -633,7 +570,7 @@ class BaseMap:
                 cands, crg, ccg = _base_filter(_floor_to_cands(vgx[case_a], vgy[case_a]))
                 if len(cands) > 0:
                     # all_uninit : (Q,) bool – True if NO direction at this candidate has been estimated yet
-                    all_uninit = np.all(self.TravMap_MetaInfo[crg, ccg] == NINIT_T, axis=-1)
+                    all_uninit = np.all(self._graph_node_rows(cands, 'meta', NINIT_T) == NINIT_T, axis=-1)
                     _add_new(cands[all_uninit])
 
             # --- Case B: terrain changed ---
@@ -656,8 +593,10 @@ class BaseMap:
                 if len(cands) > 0:
                     # Build the 4 floor-aligned neighbours for each candidate to check whether
                     # the estimation wavefront has already reached this vicinity.
-                    offsets = np.array([[-R, -R], [-R, 0.], [0., -R], [0., 0.]])  # (4, 2)
-                    nbr     = cands[:, None, :] + offsets[None]  # (Q, 4, 2) – 4 neighbours per candidate
+                    # Symmetric: the candidate itself and its +-x / +-y lattice neighbours (the former
+                    # {-R, 0} x {-R, 0} set only looked to -x/-y, so the wavefront grew one way only).
+                    offsets = np.array([[0., 0.], [-R, 0.], [R, 0.], [0., -R], [0., R]])  # (5, 2)
+                    nbr     = cands[:, None, :] + offsets[None]  # (Q, 5, 2) – neighbours per candidate
                     nbr_rg  = ((self.map_xmax - nbr[:, :, 0]) / self.map_resolution).astype(int)  # (Q, 4)
                     nbr_cg  = ((self.map_ymax - nbr[:, :, 1]) / self.map_resolution).astype(int)  # (Q, 4)
                     # nbr_valid : (Q, 4) bool – which neighbours fall inside the global map
@@ -667,15 +606,13 @@ class BaseMap:
                     # near_preest : (Q,) bool – True if any in-bounds neighbour has at least one
                     # estimated traversability direction (i.e. the wavefront has reached nearby)
                     near_preest = np.zeros(len(cands), dtype=bool)
-                    for j in range(4):
+                    for j in range(len(offsets)):
                         v = nbr_valid[:, j]  # (Q,) bool – which candidates have a valid j-th neighbour
                         if not np.any(v):
                             continue
-                        # Clamp out-of-bounds indices to 0 for safe array access; masked out by `v` below
-                        rg_j = np.where(v, nbr_rg[:, j], 0)
-                        cg_j = np.where(v, nbr_cg[:, j], 0)
-                        # has_nonnull : (Q,) bool – neighbour j is valid AND has some estimated direction
-                        has_nonnull = v & np.any(self.TravMap_MetaInfo[rg_j, cg_j] != NINIT_T, axis=-1)
+                        # has_nonnull : (Q,) bool – neighbour j is valid AND its lattice node has some
+                        # estimated direction (off-map neighbours are masked out by `v`)
+                        has_nonnull = v & np.any(self._graph_node_rows(nbr[:, j, :], 'meta', NINIT_T) != NINIT_T, axis=-1)
                         near_preest |= has_nonnull
 
                     # Discard candidates not adjacent to the estimation wavefront
@@ -685,7 +622,7 @@ class BaseMap:
 
                     if len(cands) > 0:
                         # any_uninit : (Q,) bool – candidate still has at least one unestimated direction
-                        any_uninit = np.any(self.TravMap_MetaInfo[crg, ccg] == NINIT_T, axis=-1)
+                        any_uninit = np.any(self._graph_node_rows(cands, 'meta', NINIT_T) == NINIT_T, axis=-1)
                         _add_new(cands[any_uninit])
 
             # Commit all new candidates in one allocation instead of one np.append per point
@@ -759,10 +696,10 @@ class BaseMap:
 
 
     def visualize_maps(self, map_theta, path_plan = None, save_dir = None):
-        # save_dir: when given, save the Elevation and Traversability figures as PDFs into
-        # this directory (used by the one-time experiment snapshot dump).
-
-        theta_layer = self.get_theta_layer(map_theta)
+        # save_dir: when given, save the Elevation figure as a PDF into this directory (used by the
+        # one-time experiment snapshot dump). Traversability has no dense grid to draw any more;
+        # the graph is drawn by the planner's 'traversability_graph' dump and /graph_visualization.
+        # map_theta is kept for call-site compatibility (it selected the dense map's heading layer).
 
 
         path_plan = np.array(path_plan).reshape(-1,2) if path_plan is not None else None
@@ -803,43 +740,6 @@ class BaseMap:
                 # Interactive use only: pop up the window. Skipped in headless snapshot mode
                 # (save_dir given) so the one-time experiment dump never opens GUI windows.
                 self._mapfig_elev.show()
-
-
-
-
-
-
-        ####################################### Traversability map #######################################
-        if not hasattr(self, '_mapfig_trav'):
-            self._mapfig_trav = MapFigure(2, (0, 660, 480, 420))
-        self._mapfig_trav.get_or_create()
-
-        plt.imshow(self.TraversabilityMap[:,:,theta_layer,self.viz_channel], cmap='coolwarm_r', vmin=self.viz_vmin, vmax=self.viz_vmax)
-        plt.title(f"Traversability Map", fontproperties=FONT_PROP, fontsize=FS_TITLE)
-        self._mapfig_trav.apply_colorbar(self.viz_cbar_label)
-
-        if path_plan is not None and path_plan.shape[0] > 0:
-            # plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], "Dr", markersize=3)
-            plt.plot([x[1] for x in path_plan_InGridMap], [x[0] for x in path_plan_InGridMap], '--', color='lime', linewidth=4, label = 'Global Path Plan')
-            # plt.plot(path_plan_InGridMap[0,1], path_plan_InGridMap[0,0], marker="D",color=(0,1,1), markersize=6)
-            # plt.plot(path_plan_InGridMap[-1,1], path_plan_InGridMap[-1,0], marker="*",color=(1,1,0), markersize=10)
-            pass
-
-        self._mapfig_trav.apply_axes_style(
-            self.TraversabilityMap.shape[:2],
-            (self.map_xmin, self.map_xmax),
-            (self.map_ymin, self.map_ymax),
-            grid_kwargs={}
-        )
-        self._mapfig_trav.apply_legend(loc='upper left')
-        # One-time experiment snapshot: save the traversability figure into the log dir.
-        if save_dir is not None:
-            os.makedirs(save_dir, exist_ok=True)
-            plt.savefig(os.path.join(save_dir, 'Traversability Map' + '.pdf'), format=PLOT_FORMAT, dpi=PLOT_DPI, bbox_inches='tight')
-        else:
-            # Interactive use only: pop up the window. Skipped in headless snapshot mode
-            # (save_dir given) so the one-time experiment dump never opens GUI windows.
-            self._mapfig_trav.show()
 
 
     def get_travmap(self, estimating_xypts_set, xmin, xmax, ymin, ymax):
@@ -1072,9 +972,9 @@ class BaseMap:
         # TODO: there could be latency issue for robot's position when called by MPC in the future.
 
 
-        if self.map_resolution is None or self.ElevationMap is None or self.TraversabilityMap is None:
+        if self.map_resolution is None or self.ElevationMap is None or not self.is_TraversabilityMap_built:
             return self.toorisky_v, self.toorisky_w
-        
+
         cmd_v_limit = self.maximum_cmd_v
         cmd_w_limit = self.maximum_cmd_w
 
@@ -1083,7 +983,9 @@ class BaseMap:
         num_points = int(lookahead_distance/discretization)
         angle_tolerance = np.deg2rad(lookahead_angle)
 
-        counter = 0
+        # Fan of in-map sample points ahead of the robot, in sampling order: world (x, y) and
+        # heading layer per sample; looked up from the shared graph in ONE batch below.
+        sample_xs, sample_ys, sample_layers = [], [], []
         for i in range(num_points):
             delta_dist = i * discretization
             
@@ -1103,19 +1005,24 @@ class BaseMap:
                 if row < 0 or row >= self.map_size_rows or col < 0 or col >= self.map_size_cols:
                     continue
 
-                cmd_v = self.TraversabilityMap[row, col, theta_layer, 0]
-                cmd_w = self.TraversabilityMap[row, col, theta_layer, 1]
+                sample_xs.append(x)
+                sample_ys.append(y)
+                sample_layers.append(theta_layer)
 
+        # (n, 2) [cmd_v, cmd_w] per sample: the values of its nearest graph node; then the same
+        # running average as before.
+        sample_cmds = self.graph_cmd_at(sample_xs, sample_ys, sample_layers)
+        counter = 0
+        for cmd_v, cmd_w in sample_cmds:
+            cmd_v_limit = ( cmd_v_limit * counter + cmd_v )/(counter + 1)
+            cmd_w_limit = ( cmd_w_limit * counter + cmd_w )/(counter + 1)
+            counter += 1
 
-                cmd_v_limit = ( cmd_v_limit * counter + cmd_v )/(counter + 1)
-                cmd_w_limit = ( cmd_w_limit * counter + cmd_w )/(counter + 1)
-                counter += 1
-
-                # if cmd_v != 0:
-                #     cmd_v_limit = np.min([cmd_v_limit, cmd_v])
-                #     cmd_w_limit = np.min([cmd_w_limit, cmd_w])
-                # else:
-                #     print("You are near obstacles")
+            # if cmd_v != 0:
+            #     cmd_v_limit = np.min([cmd_v_limit, cmd_v])
+            #     cmd_w_limit = np.min([cmd_w_limit, cmd_w])
+            # else:
+            #     print("You are near obstacles")
         
 
         return cmd_v_limit, cmd_w_limit
@@ -1140,9 +1047,9 @@ class BaseMap:
         robot_heading : float
             The current heading of the robot in radians (reserved for future use).
         total_lookahead_time : float
-            Total lookahead time in seconds. The local planner (main.py::_select_waypoint) pins
-            cmd_v_limit/cmd_w_limit to 1.0 and passes cfg.waypoint_lookahead_distance here, so
-            reachable_radius below collapses to that fixed distance in metres.
+            Total lookahead time in seconds. A caller that pins cmd_v_limit/cmd_w_limit to 1.0
+            and passes a distance in metres here makes reachable_radius below collapse to that
+            fixed distance.
         cmd_v_limit : float
             Maximum linear velocity limit.
         cmd_w_limit : float
@@ -1256,11 +1163,12 @@ class BaseMap:
         return False
 
     
-    def pose_callback(self, msg: PoseStamped):
+    def pose_callback(self, msg):   # msg: geometry_msgs/PoseStamped, or any object with .pose.position/.orientation
         p = msg.pose.position
         q = msg.pose.orientation
         quat = [q.x, q.y, q.z, q.w]
-        roll, pitch, yaw = tf_trans.euler_from_quaternion(quat)
+        # transforms3d takes [w, x, y, z]; 'sxyz' matches tf_transformations.euler_from_quaternion.
+        roll, pitch, yaw = tf3.euler.quat2euler([quat[3], quat[0], quat[1], quat[2]], 'sxyz')
         msg_yaw = yaw
         self.robot_x = p.x
         self.robot_y = p.y
@@ -1272,8 +1180,6 @@ class BaseMap:
 
     def robo_centric_map_callback(self, msg):
 
-        if not self.is_RobocentricMap_received:
-            self.is_RobocentricMap_received = True
         # start = time()
         # rospy.loginfo("Received GridMap message")
 
@@ -1290,7 +1196,12 @@ class BaseMap:
 
         # Build layer arrays before acquiring the lock to minimize lock hold time
         layers = msg.layers
-        new_center_pos = (msg.info.pose.position.x, msg.info.pose.position.y, msg.info.pose.position.z)
+        # elevation_mapping publishes the RAW base position as info.pose (elevation_mapping_node.py
+        # publish_map: _map_t), while its grid centre moves in whole cells (move_to): snap x/y back
+        # onto the cell grid, else every local map lands up to res/2 off per axis.
+        new_center_pos = (round(msg.info.pose.position.x / self.map_resolution) * self.map_resolution,
+                          round(msg.info.pose.position.y / self.map_resolution) * self.map_resolution,
+                          msg.info.pose.position.z)
         new_center_rot = (msg.info.pose.orientation.x, msg.info.pose.orientation.y, msg.info.pose.orientation.z, msg.info.pose.orientation.w)
         new_layer_data = {}
         for i, layer in enumerate(layers):
@@ -1305,6 +1216,10 @@ class BaseMap:
             self.RobocentricMap_CenterPosOffset_Worldfr = new_center_pos
             self.RobocentricMap_CenterRotOffset_Worldfr = new_center_rot
             self.layer_data.update(new_layer_data)
+        # Raised only once the layers are in place: Update_map (main loop) must never see the flag
+        # with no layer data (KeyError on the first map).
+        if not self.is_RobocentricMap_received:
+            self.is_RobocentricMap_received = True
         # rospy.loginfo("Map position: %s" % str(self.RobocentricMap_CenterPosOffset_Worldfr))
         # rospy.loginfo("Layers: %s" % layers)
 
@@ -1378,10 +1293,11 @@ class CMDbasedMap(BaseMap):
         self.viz_cbar_label = "Linear Velocity (m/s)"
 
         # ── Shared-memory graph (Part 2) ─────────────────────────────────────
-        # Owned only by the writer-side map when global_planner_type == "Astar";
-        # created lazily by _build_shared_graph() once the coarse lattice geometry
-        # is known. Left None everywhere else (base map, reader proxy, other
-        # planner types), which disables every graph hook below.
+        # The ONLY traversability store. Owned by the writer-side map (every planner
+        # type); created by _build_shared_graph() once the coarse lattice geometry
+        # is known (its create_grid also seeds the neutral interior and the
+        # too-risky, isolated map border). None on a reader proxy, which reads it
+        # through graph_cmd_at's lazily attached SharedGraphReader instead.
         self.graph_writer = None
         # Retained coarse estimation-lattice CENTER bounds (kx_min*R ... kx_max*R),
         # the expected-update domain used to classify write-back points. Distinct
@@ -1391,66 +1307,41 @@ class CMDbasedMap(BaseMap):
         # float32-roundoff tolerance for stored-coordinate equality checks; set
         # from the actual snapped bounds in _build_shared_graph().
         self._graph_coord_tol = None
-
-
-    def _initialize_traversability_map_values(self):
-        """Initialize neutral commands, then mark the non-inferable map border too-risky."""
-        super()._initialize_traversability_map_values()
-
-        if (self.map_resolution is None or not np.isfinite(self.map_resolution)
-                or self.map_resolution <= 0.0):
-            raise ValueError(
-                "_initialize_traversability_map_values requires a finite positive "
-                f"map_resolution, got {self.map_resolution}")
-        if not np.isfinite(self.local_patch_size) or self.local_patch_size <= 0.0:
-            raise ValueError(
-                "_initialize_traversability_map_values requires a finite positive "
-                f"local_patch_size, got {self.local_patch_size}")
-
-        # half_patch_cells is the half-side of each TravFormer elevation input in
-        # fine-map cells. Border cells closer than this cannot provide a complete
-        # patch, so every heading layer starts at the exact too-risky sentinel.
-        half_patch_cells = int(np.round(0.5 * self.local_patch_size / self.map_resolution))
-        if half_patch_cells <= 0:
-            return
-
-        rows, cols = self.TraversabilityMap.shape[:2]
-        row_indices = np.arange(rows)[:, None]  # (rows, 1) fine-map row index
-        col_indices = np.arange(cols)[None, :]  # (1, cols) fine-map column index
-        boundary_mask = ((row_indices < half_patch_cells)
-                         | (row_indices >= rows - half_patch_cells)
-                         | (col_indices < half_patch_cells)
-                         | (col_indices >= cols - half_patch_cells))  # (rows, cols)
-        self.TraversabilityMap[:, :, :, 0][boundary_mask] = self.toorisky_v
-        self.TraversabilityMap[:, :, :, 1][boundary_mask] = self.toorisky_w
-        self.TravMap_MetaInfo[boundary_mask] = TravmapInfo_IntEnum.TRAV_Estimated.value
+        # Reader-side graph access for graph_cmd_at (planner process): one lazily
+        # attached SharedGraphReader and one reused GraphSnapshot buffer.
+        self._graph_lookup_reader = None
+        self._graph_lookup_snapshot = None
 
 
     # =====================================================================
     # Shared-memory graph integration (Part 2) — one contiguous region.
     #
-    # Responsibilities, all writer-side and all no-ops when self.graph_writer
-    # is None (base map, reader proxy, or global_planner_type != "Astar"):
+    # Responsibilities. Writer-side unless noted; the writer methods raise
+    # SharedGraphError when no graph is owned (_require_graph_writer), because
+    # the graph is the ONLY traversability store (there is no dense grid):
     #   _build_shared_graph()        : lattice-aligned graph construction
-    #   _close_shared_graph()        : shutdown cleanup
+    #   _close_shared_graph()        : shutdown cleanup (also the reader lookup)
     #   _graph_layer_too_risky_mask()/_graph_node_has_too_risky() : the single
     #                                  too-risky predicate (shared with tests)
-    #   _apply_graph_update()        : mirror one map-update's coarse-lattice
+    #   _apply_graph_update()        : write one map-update's coarse-lattice
     #                                  cmd_v/cmd_w/meta into node payloads and
     #                                  maintain the aggregate too-risky topology
+    #   _graph_slots_at() / _graph_node_rows() : world points -> lattice node
+    #                                  slots / payload rows (status gates)
+    #   graph_cmd_at()               : writer OR reader — world points -> cmd of
+    #                                  the nearest lattice node
     #
-    # The graph is a MIRROR of the existing TraversabilityMap / TravMap_MetaInfo
-    # coarse-lattice state, not a second estimator: the capture site (Step 9)
-    # carries the exact cmd_v/cmd_w/meta it writes to
-    # the dense grid into the record (direct write, no read-back), and
-    # _apply_graph_update never recomputes values or heading-layer selection.
+    # The capture site (Step 9)
+    # carries the exact cmd_v/cmd_w/meta it decided into the record (direct
+    # write), and _apply_graph_update never recomputes values or heading-layer
+    # selection.
     # =====================================================================
 
     def _build_shared_graph(self):
         """
-        Construct the lattice-aligned shared graph exactly once, when
-        global_planner_type == "Astar". No-op for every other planner type
-        (leaves self.graph_writer = None) and if already built.
+        Construct the lattice-aligned shared graph exactly once, for EVERY
+        planner type: it is the only traversability store. No-op if already
+        built.
 
         Node centers land on the estimation lattice (world multiples of
         TravUpdate_XYResolution clipped to the map bounds) via create_grid's
@@ -1459,9 +1350,6 @@ class CMDbasedMap(BaseMap):
         """
         # Idempotent: build at most once.
         if self.graph_writer is not None:
-            return
-        # Existing planner selector gates construction (no graph-specific flag).
-        if str(cfg.get('global_planner_type', 'Astar')) != "Astar":
             return
         # Geometry must be known (Initilize_map has run and set map bounds/res).
         if self.map_resolution is None or not self.is_ElevationMap_built:
@@ -1599,11 +1487,159 @@ class CMDbasedMap(BaseMap):
               f"Edges store immutable geometric length only (no cmd/status/cost).")
 
     def _close_shared_graph(self):
-        """Idempotently close + unlink the owned graph (shutdown hook)."""
+        """Idempotently close + unlink the owned graph (shutdown hook); close a reader lookup."""
         gw = self.graph_writer
         if gw is not None:
             self.graph_writer = None
             gw.cleanup()
+        # Reader-side lookup handles (graph_cmd_at on a reader proxy): close, never unlink.
+        rd = getattr(self, '_graph_lookup_reader', None)
+        if rd is not None:
+            self._graph_lookup_reader = None
+            self._graph_lookup_snapshot = None
+            rd.close()
+
+    def _require_graph_writer(self, where):
+        """Return the owned graph writer; raise when there is none (it is the only trav store)."""
+        gw = getattr(self, 'graph_writer', None)
+        if gw is None:
+            raise SharedGraphError(
+                f"{where}: this map owns no shared graph writer, and the shared graph is the "
+                f"ONLY traversability store (the dense TraversabilityMap was removed). Writer-side "
+                f"traversability code needs CMDbasedMapWithBackend.Initilize_map (which builds the "
+                f"graph) to have run; map type={type(self).__name__}, "
+                f"is_ElevationMap_built={getattr(self, 'is_ElevationMap_built', None)}")
+        return gw
+
+    def _graph_slots_at(self, pts):
+        """
+        (M, 2) world [x, y] -> (M,) int slot of the lattice node whose R x R estimation cell
+        contains each point (its nearest lattice point: the cell Step 9 writes for that node),
+        -1 when that lattice point lies outside the retained lattice-center bounds.
+        nearest_node runs once per DISTINCT lattice point, and its hit must sit exactly on
+        the lattice point (same check as _apply_graph_update).
+        """
+        gw = self._require_graph_writer('_graph_slots_at')
+        R = float(self.TravUpdate_XYResolution)
+        tol = float(self._graph_coord_tol)
+        lxmin, lxmax, lymin, lymax = self._graph_lattice_bounds
+        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+        if pts.shape[0] == 0:
+            return np.empty(0, dtype=np.int64)
+        # k: (M, 2) integer lattice index of each point's nearest lattice point
+        k = np.round(pts / R).astype(np.int64)
+        uniq, inv = np.unique(k, axis=0, return_inverse=True)       # (U, 2), (M,)
+        uniq_slots = np.full(len(uniq), -1, dtype=np.int64)          # (U,) slot per lattice point
+        for u, (kx, ky) in enumerate(uniq):
+            lx, ly = float(kx) * R, float(ky) * R
+            if not (lxmin - tol <= lx <= lxmax + tol and lymin - tol <= ly <= lymax + tol):
+                continue                                             # no node: outside the lattice
+            slot = gw.nearest_node(lx, ly)
+            if (slot == -1 or abs(float(gw.node_x[slot]) - lx) > tol
+                    or abs(float(gw.node_y[slot]) - ly) > tol):
+                raise SharedGraphError(
+                    f"_graph_slots_at: in-domain lattice point ({lx:.6g}, {ly:.6g}) resolved to "
+                    f"slot {slot}"
+                    + ("" if slot == -1 else
+                       f" at ({float(gw.node_x[slot]):.6g}, {float(gw.node_y[slot]):.6g})")
+                    + f"; expected a node exactly there (coord_tol={tol:.3g}, R={R}) — "
+                      f"lattice/graph mismatch")
+            uniq_slots[u] = slot
+        return uniq_slots[np.asarray(inv).reshape(-1)]
+
+    def _graph_node_rows(self, pts, payload, fill):
+        """
+        (M, 2) world [x, y] -> (M, L) float64 copy of the named node payload ('cmd_v',
+        'cmd_w' or 'meta') of each point's lattice node (_graph_slots_at), `fill` where a
+        point has no node. With payload='meta' and fill=TRAV_NotInitialized this is the
+        per-cell traversability status the removed TravMap_MetaInfo held.
+        """
+        slots = self._graph_slots_at(pts)                                    # (M,) int, -1 = none
+        rows = np.full((len(slots), int(self.TraversabilityMap_size_layers)), fill,
+                       dtype=np.float64)                                     # (M, L)
+        ok = slots >= 0
+        if ok.any():
+            rows[ok] = np.asarray(self.graph_writer.node_payload(payload))[slots[ok]]
+        return rows
+
+    def _graph_lattice_values(self):
+        """
+        One coherent read of the graph's cmd payloads regridded onto the lattice. Returns
+        (values, kx0, ky0): values (nx, ny, L, 2) float64 [cmd_v, cmd_w], x/y index ascending
+        in world coordinate, and kx0/ky0 the integer lattice index of values[0, 0]
+        (world = k * R). The writer reads its own arrays; a reader proxy (no writer) takes a
+        torn-free snapshot through a lazily attached SharedGraphReader. Requires every active
+        node on the R-lattice, tiling a full nx x ny grid (the writer's create_grid graph).
+        """
+        src = getattr(self, 'graph_writer', None)
+        if src is None:
+            # Reader process (planner proxy): attach once, then one snapshot per call, reusing
+            # one buffer. Attaching fails loudly when the world model has not built the graph.
+            if self._graph_lookup_reader is None:
+                from statenav_global.world_model.shared_graph import SharedGraphReader
+                self._graph_lookup_reader = SharedGraphReader(
+                    GRAPH_LAYOUT, attach_timeout=float(cfg.get('graph_astar_attach_timeout', 10.0)))
+            self._graph_lookup_snapshot = self._graph_lookup_reader.snapshot(
+                into=self._graph_lookup_snapshot,
+                max_retries=int(cfg.get('graph_astar_snapshot_max_retries', 50)))
+            src = self._graph_lookup_snapshot
+        hwm = int(src.node_hwm)
+        active = np.asarray(src.node_active[:hwm]) == 1                       # (hwm,) bool
+        x = np.asarray(src.node_x[:hwm], dtype=np.float64)[active]            # (n,) node x [m]
+        y = np.asarray(src.node_y[:hwm], dtype=np.float64)[active]            # (n,) node y [m]
+        if x.size == 0:
+            raise SharedGraphError("_graph_lattice_values: the shared graph has no active node")
+        R = float(self.TravUpdate_XYResolution)
+        kx = np.rint(x / R).astype(np.int64)                                  # (n,) lattice index x
+        ky = np.rint(y / R).astype(np.int64)                                  # (n,) lattice index y
+        # Guard: every node on the lattice, and the nodes tile a full grid with no duplicate.
+        tol = 1.0e-3                                                          # [m], far above float32 noise
+        off = (np.abs(kx * R - x) > tol) | (np.abs(ky * R - y) > tol)
+        kx0, ky0 = int(kx.min()), int(ky.min())
+        nx, ny = int(kx.max()) - kx0 + 1, int(ky.max()) - ky0 + 1
+        flat = (kx - kx0) * ny + (ky - ky0)
+        if off.any() or nx * ny != x.size or np.unique(flat).size != x.size:
+            raise SharedGraphError(
+                f"_graph_lattice_values: {x.size} active nodes do not tile a full {nx}x{ny} "
+                f"R={R} m lattice ({int(off.sum())} off-lattice); trav_estimation_resoultion "
+                f"must match the world model's and the graph must be its create_grid lattice")
+        n_layers = int(self.TraversabilityMap_size_layers)
+        values = np.empty((nx, ny, n_layers, 2), dtype=np.float64)            # (nx, ny, L, 2)
+        values[kx - kx0, ky - ky0, :, 0] = np.asarray(src.node_payload('cmd_v')[:hwm])[active]
+        values[kx - kx0, ky - ky0, :, 1] = np.asarray(src.node_payload('cmd_w')[:hwm])[active]
+        return values, kx0, ky0
+
+    def graph_cmd_at(self, xs, ys, layers):
+        """
+        Nearest-node traversability lookup: (n,) world x, y [m] and heading layers ->
+        (n, 2) float64 [cmd_v, cmd_w] of the lattice node nearest each point (the node whose
+        R x R estimation cell contains it — the same rounding _graph_slots_at and the A*
+        planner use). Lattice indices are clamped to the graph's extent, so every point gets a
+        real node (a point past the outermost node reads that node). Works on the writer and on
+        a reader proxy (see _graph_lattice_values); one coherent graph read per call.
+        """
+        xs = np.asarray(xs, dtype=np.float64).reshape(-1)          # (n,) world x per query [m]
+        ys = np.asarray(ys, dtype=np.float64).reshape(-1)          # (n,) world y per query [m]
+        layers = np.asarray(layers, dtype=np.int64).reshape(-1)    # (n,) heading layer per query
+        if not (xs.shape == ys.shape == layers.shape):
+            raise ValueError(f"graph_cmd_at: xs{xs.shape}, ys{ys.shape} and layers{layers.shape} "
+                             f"must have equal length")
+        if xs.size == 0:
+            return np.empty((0, 2), dtype=np.float64)
+        n_layers = int(self.TraversabilityMap_size_layers)
+        if not (np.isfinite(xs).all() and np.isfinite(ys).all()):
+            raise ValueError(f"graph_cmd_at: non-finite query point(s): "
+                             f"{int((~np.isfinite(xs) | ~np.isfinite(ys)).sum())} of {xs.size}")
+        if layers.min() < 0 or layers.max() >= n_layers:
+            raise ValueError(f"graph_cmd_at: heading layer out of range — "
+                             f"[{layers.min()}, {layers.max()}] of {n_layers}")
+        values, kx0, ky0 = self._graph_lattice_values()            # (nx, ny, L, 2)
+        nx, ny = values.shape[:2]
+        R = float(self.TravUpdate_XYResolution)
+        # (n,) lattice index of each point's nearest node, clamped onto the existing lattice
+        ix = np.clip(np.round(xs / R).astype(np.int64) - kx0, 0, nx - 1)
+        iy = np.clip(np.round(ys / R).astype(np.int64) - ky0, 0, ny - 1)
+        return values[ix, iy, layers]                              # (n, 2) [cmd_v, cmd_w]
 
     def _graph_layer_too_risky_mask(self, cmd_v_row, cmd_w_row, meta_row):
         """
@@ -1633,26 +1669,24 @@ class CMDbasedMap(BaseMap):
 
     def _apply_graph_update(self, graph_records):
         """
-        Mirror one map update's coarse-lattice write-back into the shared graph
-        and maintain the aggregate too-risky topology invariant.
+        Write one map update's coarse-lattice values into the shared graph (the
+        only traversability store) and maintain the aggregate too-risky topology
+        invariant.
 
         graph_records : list of (x, y, theta_layer, cmd_v, cmd_w, meta) captured
             at the point each value is DECIDED — the _compute_travmap Step-9
             loop. The payload is
-            carried in the record (direct write); TraversabilityMap /
-            TravMap_MetaInfo are NOT read back here, so the graph no longer
-            depends on the dense grid (still a mirror, never a second
-            calculation — the carried values are the exact values the dense
-            write used).
+            carried in the record (direct write), never recomputed here.
 
         All predictable coordinate/payload validation completes before the outer
         edit_batch() opens. Any graph-mutation exception propagates out (the
         caller must stop, not keep using the graph): edit_batch() is only a
-        reader publication barrier, not a rollback.
+        reader publication barrier, not a rollback. Raises SharedGraphError when
+        records arrive but no graph is owned (they would otherwise be lost).
         """
-        gw = self.graph_writer
-        if gw is None or not graph_records:
+        if not graph_records:
             return
+        gw = self._require_graph_writer('_apply_graph_update')
 
         R = float(self.TravUpdate_XYResolution)
         tol = float(self._graph_coord_tol)
@@ -1697,10 +1731,7 @@ class CMDbasedMap(BaseMap):
                     f"lattice-center bounds x[{lxmin}, {lxmax}] y[{lymin}, {lymax}], "
                     f"R={R}, lookup_radius={lookup_r:.6g} — off-lattice write-back point")
             # Unpack the CARRIED payload decided at the capture site (direct
-            # write — no dense-grid read-back). The coarse point's own fine cell
-            # keeps its Step-9 value through the interpolation pass (the cell is
-            # a bilinear corner), so the carried value equals exactly the
-            # cmd_v/cmd_w/meta the dense map holds for this point+layer.
+            # write): the exact cmd_v/cmd_w/meta for this point+layer.
             cmd_v = np.float32(rec[3])
             cmd_w = np.float32(rec[4])
             # Finiteness guard kept on the carried values (defensive; the
@@ -1858,8 +1889,10 @@ class CMDbasedMap(BaseMap):
             # ── Step 3: Body-frame → map-pixel transform ──────────────────────────────
             # Map convention: row = (xmax - world_x) / res, col = (ymax - world_y) / res.
             # row_centers, col_centers: map-pixel of each query point center, shape (N,).
-            row_centers = ((self.map_xmax - xs) / self.map_resolution).astype(int)
-            col_centers = ((self.map_ymax - ys) / self.map_resolution).astype(int)
+            # round, not astype(int): a lattice point lies exactly on a cell boundary, where truncation
+            # flips between two cells by float rounding and shifts the patch by one cell
+            row_centers = np.round((self.map_xmax - xs) / self.map_resolution).astype(int)
+            col_centers = np.round((self.map_ymax - ys) / self.map_resolution).astype(int)
             cos_t = np.cos(thetas)   # shape (N,)
             sin_t = np.sin(thetas)   # shape (N,)
 
@@ -1945,13 +1978,21 @@ class CMDbasedMap(BaseMap):
             w_bins = w_bins[::-1]
 
             # ── Step 8: Chunked TravFormer inference ──────────────────────────────────
-            # CMD_CHUNK: number of velocity bins batched into a single GPU forward pass.
-            # Higher = fewer kernel launches (faster), but scales GPU memory by CMD_CHUNK.
-            # Halved automatically on CUDA OOM until it reaches 1 (original per-bin behavior).
+            # CMD_CHUNK: number of velocity bins batched into a single inference call.
+            # Higher = fewer kernel launches (faster); GPU memory scales with the PATCHES per
+            # forward pass, so CMD_CHUNK is derived from the patch cap MAX_PATCHES below.
+            # On CUDA OOM the patch cap is halved (down to 64 patches) and the chunk retried.
             # Skip inference entirely when size==0 (all patches were NaN/OOB): every
             # xyc_patchindex entry already has patchindex==-1, so Step 9 will fall back
             # to InitialGuess for all points without needing TravFormer output.
-            CMD_CHUNK = 2
+            # MAX_PATCHES: max patches per forward pass (planning_config travformer_max_batch_patches,
+            # a multiple of 64). Bins per call = MAX_PATCHES // size, but never more than the former
+            # fixed 2: the early exit below is checked once per call, and runtime updates (size up to
+            # MAX_PATCHES / 2) keep exactly their previous batching. A call larger than the cap (one bin
+            # of more than MAX_PATCHES patches) runs as MAX_PATCHES-sized slices (see the inference call).
+            MAX_PATCHES = self.travformer_max_batch_patches
+            MAX_BINS_PER_CALL = 2
+            CMD_CHUNK = max(1, min(MAX_BINS_PER_CALL, MAX_PATCHES // size)) if size > 0 else 1
             n_bins = len(v_bins)  # total number of candidate speed levels to evaluate
             chunk_start = 0
             while size > 0 and chunk_start < n_bins:
@@ -1987,13 +2028,24 @@ class CMDbasedMap(BaseMap):
                 try:
                     start = time()
                     # instab_mean_cat, instab_std_cat: each (n_chunk*2*size, 1)
-                    [instab_mean_cat, instab_std_cat] = self.TravFormer_Inference(None, patch_chunk, cmd_chunk, model=self.elevonly_vw2instab_model, device=self.device)
+                    # Forward passes of at most MAX_PATCHES patches (GPU memory cap). Eval mode (BatchNorm on
+                    # running stats, no dropout), so a patch's output does not depend on its slice.
+                    outs = [self.TravFormer_Inference(None, patch_chunk[s:s + MAX_PATCHES], cmd_chunk[s:s + MAX_PATCHES],
+                                                      model=self.elevonly_vw2instab_model, device=self.device)
+                            for s in range(0, len(cmd_chunk), MAX_PATCHES)]
+                    instab_mean_cat = np.concatenate([m for m, _ in outs], axis=0)
+                    instab_std_cat = np.concatenate([sd for _, sd in outs], axis=0)
                 except RuntimeError as e:
                     err = str(e).lower()
                     # Catch both OOM and "invalid configuration argument" (CUDA grid-dim overflow
                     # when batch×num_heads exceeds the 65535 hardware limit at large resolutions).
-                    if ('out of memory' in err or 'invalid configuration argument' in err) and CMD_CHUNK > 1:
-                        CMD_CHUNK = max(1, CMD_CHUNK // 2)
+                    if ('out of memory' in err or 'invalid configuration argument' in err) and MAX_PATCHES > 64:
+                        print(f"[GlobalMap] TravFormer pass of up to {MAX_PATCHES} patches failed ({e}); "
+                              f"retrying with half the patch cap")
+                        # halve the pass that actually failed (min(cap, rows of this call)); halving a
+                        # cap larger than the call would retry the identical pass
+                        MAX_PATCHES = max(64, min(MAX_PATCHES, len(cmd_chunk)) // 2 // 64 * 64)
+                        CMD_CHUNK = max(1, min(MAX_BINS_PER_CALL, MAX_PATCHES // size))
                         del patch_chunk, cmd_chunk  # free CPU memory before retry
                         if self.device != 'cpu':
                             torch.cuda.empty_cache()
@@ -2063,17 +2115,15 @@ class CMDbasedMap(BaseMap):
                         target_v[_valid_idx, 0] = self.toorisky_v
                         target_w[_valid_idx, 0] = self.toorisky_w
 
-            # ── Step 9: Write safe speeds back to TraversabilityMap ──────────────────
+            # ── Step 9: Write safe speeds back to the shared graph ───────────────────
             # Iterate all N query points in the same order as estimating_xycpts_set so that
             # patchindex_counter stays aligned with xyc_patchindex rows.
             #
-            # Shared-graph mirror hook (Part 2): collect the (x, y, heading layer)
-            # touched by this write-back — the update membership and heading-layer
-            # selection computed here, NOT recomputed. None when no graph is owned
-            # (base map, reader proxy, or non-"Astar" planner), which disables the
-            # hook. Each record CARRIES the cmd_v/cmd_w/meta decided here (direct
-            # write); _apply_graph_update no longer reads the dense map back.
-            graph_records = [] if self.graph_writer is not None else None
+            # graph_records: one record per (x, y, heading layer) this write-back decides,
+            # CARRYING its cmd_v/cmd_w/meta (direct write); _apply_graph_update writes them
+            # all into the graph (the only traversability store) after the loop.
+            self._require_graph_writer('_compute_travmap')
+            graph_records = []
             patchindex_counter = 0
             for xyc in estimating_xycpts_set:
 
@@ -2089,129 +2139,30 @@ class CMDbasedMap(BaseMap):
                 if patchindex == -1:
                     cmd_v = self.InitialGuess_cmd_v
                     cmd_w = self.InitialGuess_cmd_w
+                    # NaN in the patch: InitialGuess but TRAV_NotInitialized, so Case A re-queues the node
+                    # once the missing cells are measured (a TRAV_Estimated stamp is never re-queued)
+                    meta = int(self.TravmapInfo_IntEnum.TRAV_NotInitialized.value)
                 else:
                     # target_v/w[patchindex] holds the largest speed that passed the VaR threshold,
                     # or toorisky_v/w (sentinel) if no speed was safe for this patch.
                     cmd_v = target_v[patchindex, 0]
                     cmd_w = target_w[patchindex, 0]
-
-                # The TraversabilityMap is updated in grid cells of size TravUpdate_XYResolution.
-                # Compute the world-space corners of the square cell centered at (x, y):
-                #   BL = bottom-left (smaller x, smaller y)
-                #   TR = top-right   (larger  x, larger  y)
-                square_BL_xyc = np.array([x - self.TravUpdate_XYResolution/2, y - self.TravUpdate_XYResolution/2])
-                square_TR_xyc = np.array([x + self.TravUpdate_XYResolution/2, y + self.TravUpdate_XYResolution/2])
-
-                # Convert world corners to map pixel indices.
-                # Map convention: row = (xmax - world_x)/res  → larger x = smaller row (TR → smaller row).
-                #                 col = (ymax - world_y)/res  → larger y = smaller col (TR → smaller col).
-                # So row_start < row_end and col_start < col_end, giving a valid slice.
-                square_BL_entry = np.array([ round( (self.map_xmax - square_BL_xyc[0])/self.map_resolution ), round( (self.map_ymax - square_BL_xyc[1])/self.map_resolution ) ])
-                square_TR_entry = np.array([ round( (self.map_xmax - square_TR_xyc[0])/self.map_resolution ), round( (self.map_ymax - square_TR_xyc[1])/self.map_resolution ) ])
+                    meta = int(self.TravmapInfo_IntEnum.TRAV_Estimated.value)
 
                 # Discretize the canonical [-π, π) heading to the nearest layer.
                 theta = Utils.wrap_to_pi(theta)
                 theta_layer = self.get_theta_layer(theta)
 
-                # Clip pixel bounds to stay within the map and write cmd_v, cmd_w, and status.
-                row_start = int(np.clip(square_TR_entry[0], 0, self.map_size_rows))
-                row_end   = int(np.clip(square_BL_entry[0], 0, self.map_size_rows))
-                col_start = int(np.clip(square_TR_entry[1], 0, self.map_size_cols))
-                col_end   = int(np.clip(square_BL_entry[1], 0, self.map_size_cols))
-                self.TraversabilityMap[row_start:row_end, col_start:col_end, theta_layer, 0] = cmd_v
-                self.TraversabilityMap[row_start:row_end, col_start:col_end, theta_layer, 1] = cmd_w
-                self.TravMap_MetaInfo[row_start:row_end, col_start:col_end, theta_layer] = self.TravmapInfo_IntEnum.TRAV_Estimated.value
+                graph_records.append((
+                    float(x), float(y), int(theta_layer),
+                    float(cmd_v), float(cmd_w),
+                    meta))
 
-                # Shared-graph mirror hook (Part 2): record this coarse point +
-                # heading layer for the post-interpolation graph mirror, carrying
-                # the exact cmd_v/cmd_w decided above plus TRAV_Estimated (direct
-                # write — no dense read-back in _apply_graph_update).
-                if graph_records is not None:
-                    graph_records.append((
-                        float(x), float(y), int(theta_layer),
-                        float(cmd_v), float(cmd_w),
-                        int(self.TravmapInfo_IntEnum.TRAV_Estimated.value)))
+            # No fine-grid interpolation pass any more: consumers that need values between
+            # lattice nodes interpolate the graph at read time (graph_cmd_at, MPPI's travgraph).
 
-
-
-
-
-
-
-
-
-
-            # Interpolation
-            N = math.floor(self.TravUpdate_XYResolution / self.map_resolution)
-            R = self.TravUpdate_XYResolution
-            _t   = np.linspace(0.0, 1.0, N + 1)
-            _sig = 1.0 / (1.0 + np.exp(-self.interp_sigmoid_k * (_t - 0.5)))
-            xi_w = (_sig - _sig[0]) / (_sig[-1] - _sig[0])    # normalize to [0,1]; f(0.5)=0.5 exactly
-            yi_w = xi_w
-
-            # (dxTL, dyTL, dxBR, dyBR, dxTR, dyTR) world-space offsets from BL corner
-            # quadrants 0-3 are defined in array space (same as original)
-            _q_offsets = [
-                ( R,  0,  0, -R,  R, -R),  # q0
-                ( 0,  R,  R,  0,  R,  R),  # q1
-                (-R,  0,  0,  R, -R,  R),  # q2
-                ( 0, -R, -R,  0, -R, -R),  # q3
-            ]
-
-            for xyc in estimating_xycpts_set:
-                theta = Utils.wrap_to_pi(xyc[2])
-                theta_layer = self.get_theta_layer(theta)
-
-                row_BL, col_BL = self.xy2grid(xyc[0], xyc[1])
-                if row_BL is None or col_BL is None:
-                    continue
-
-                for quadrant, (dxTL, dyTL, dxBR, dyBR, dxTR, dyTR) in enumerate(_q_offsets):
-                    row_TL, col_TL = self.xy2grid(xyc[0] + dxTL, xyc[1] + dyTL)
-                    if row_TL is None or col_TL is None:
-                        continue
-                    row_BR, col_BR = self.xy2grid(xyc[0] + dxBR, xyc[1] + dyBR)
-                    if row_BR is None or col_BR is None:
-                        continue
-                    row_TR, col_TR = self.xy2grid(xyc[0] + dxTR, xyc[1] + dyTR)
-                    if row_TR is None or col_TR is None:
-                        continue
-
-                    # Corner values for both map layers at once: shape (2,)
-                    BL = self.TraversabilityMap[row_BL, col_BL, theta_layer, :]
-                    TL = self.TraversabilityMap[row_TL, col_TL, theta_layer, :]
-                    BR = self.TraversabilityMap[row_BR, col_BR, theta_layer, :]
-                    TR = self.TraversabilityMap[row_TR, col_TR, theta_layer, :]
-
-                    # Bilinear interpolation over the (N+1)x(N+1) patch, both layers at once
-                    bottom = BL + xi_w[:, None] * (BR - BL)                         # (N+1, 2)
-                    top    = TL + xi_w[:, None] * (TR - TL)                         # (N+1, 2)
-                    patch  = (1 - yi_w[:, None, None]) * bottom[None] \
-                           +      yi_w[:, None, None]  * top[None]                  # (N+1, N+1, 2)
-
-                    # Write patch into the map; orientation per quadrant derived from loop indices:
-                    #   q0: TravMap[row_BL-yi, col_BL+xi]  →  patch[::-1]
-                    #   q1: TravMap[row_BL-xi, col_BL-yi]  →  patch[::-1,::-1].transpose(1,0,2)
-                    #   q2: TravMap[row_BL+yi, col_BL-xi]  →  patch[:,    ::-1]
-                    #   q3: TravMap[row_BL+xi, col_BL+yi]  →  patch.transpose(1,0,2)
-                    if quadrant == 0:
-                        _interp_vals = patch[::-1]
-                        _row_sl, _col_sl = slice(row_BL-N, row_BL+1),  slice(col_BL,   col_BL+N+1)
-                    elif quadrant == 1:
-                        _interp_vals = patch[::-1, ::-1].transpose(1, 0, 2)
-                        _row_sl, _col_sl = slice(row_BL-N, row_BL+1),  slice(col_BL-N, col_BL+1)
-                    elif quadrant == 2:
-                        _interp_vals = patch[:, ::-1]
-                        _row_sl, _col_sl = slice(row_BL,   row_BL+N+1), slice(col_BL-N, col_BL+1)
-                    elif quadrant == 3:
-                        _interp_vals = patch.transpose(1, 0, 2)
-                        _row_sl, _col_sl = slice(row_BL,   row_BL+N+1), slice(col_BL,   col_BL+N+1)
-                    self.TraversabilityMap[_row_sl, _col_sl, theta_layer, :] = _interp_vals
-
-            # ── Shared-graph mirror + topology (Part 2) ──────────────────────────
-            # The map is now final for this update (Step 9 + interpolation done).
-            # Mirror the coarse-lattice cmd_v/cmd_w/meta into node payloads and
-            # maintain the aggregate too-risky topology inside one edit_batch().
-            # No-op when no graph is owned; graph-mutation exceptions propagate.
-            if graph_records is not None:
-                self._apply_graph_update(graph_records)
+            # ── Shared-graph write + topology (Part 2) ───────────────────────────
+            # Write the coarse-lattice cmd_v/cmd_w/meta into node payloads and maintain the
+            # aggregate too-risky topology inside one edit_batch(). Graph-mutation
+            # exceptions propagate.
+            self._apply_graph_update(graph_records)

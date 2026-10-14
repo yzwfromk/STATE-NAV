@@ -1,6 +1,11 @@
 # STATE-NAV: Stability-Aware Traversability Estimation for Bipedal Navigation on Rough Terrain
 
 ## Update News!
+[Oct 14 2026]
+- MPPI local planner added (`statenav_mppi`, node `main_mppi`): it tracks the A* path while keeping every sampled command within the stability-aware velocity limits of the traversability graph.
+- The world model now keeps traversability only in the shared-memory graph and updates just the changed area of it.
+- The library runs without ROS: install only the modules you need (see "Using individual modules").
+
 [Oct 01 2026]
 - A* added in this branch (ROS2): paths are discrete, but ~100x faster than RRT* on the attached ROS bag environment. The old RRT* version can be found in the ROS2_dev branch.
 
@@ -18,6 +23,8 @@ Checkpoint for Unitree G1's blind locomotion controller released.
 ### Practical sub-module use cases
 - **Get A\* for Terrain Navigation**: A heading-aware A* over a shared-memory traversability graph. Edge costs are travel times derived from the stability-aware velocity map with a curvature-limited turn model, so the yaw dimension is handled without a full 3D search. The previous TravRRT* planner is available in the ROS2_dev branch.
   
+- **Get MPPI for Terrain-Aware Path Tracking**: A Model Predictive Path Integral (MPPI) local planner. Each control tick it samples many command sequences, rolls them out with an actuator-lag model, and scores them on path tracking and on the traversability graph, so commanded velocities stay within what the terrain allows. A ROS-free demo is in `examples/demo_mppi/`.
+  
 - **Get Bipedal Traversability for Humanoids**: An off-the-shelf bipedal traversability map—insert an elevation map, receive a traversability map.
 
 
@@ -27,7 +34,7 @@ Checkpoint for Unitree G1's blind locomotion controller released.
 
 - **Velocity-based traversability: Robot-specific (environment-agnostic) cost formulation**: Represents traversability not as a unitless cost or score, but as velocity with physical meaning. Defines the fastest velocity that a robot can traverse while maintaining instability (a robot-specific parameter) risk-sensitively within acceptable limits. This velocity representation replaces traditional path planning costs of $c_{ij} = \sum_{k \in M} (1 + w(1/t_k))^p \Delta l_k$ which depends on environment-specific hyperparameter $w$ that requires retuning for every environment.
 
-- **Safe learning-planning integration**: Rather than end-to-end learning, leverages the learned model where it can do what models cannot and integrates the learned representation effectively within a hierarchical planning strategy—as a cost term in global path planning (TravRRT* in the paper, A* in this branch) and as a constraint in MPC local planning.
+- **Safe learning-planning integration**: Rather than end-to-end learning, leverages the learned model where it can do what models cannot and integrates the learned representation effectively within a hierarchical planning strategy—as a cost term in global path planning (TravRRT* in the paper, A* in this branch) and as a constraint in MPC local planning (MPPI in this branch).
 
 - **Modular and extensible**: Provides researchers with traversability maps and path plans for bipedal locomotion trained with Digit. This branch ships a TravFormer checkpoint for Unitree G1 (`statenav_global/inference/checkpoints/checkpoint_MLL_23.pth`).
 
@@ -40,6 +47,8 @@ The model supports risk-aware planning via Value at Risk (VaR) and operates dire
 
 - **A\* Global Planning**: A heading-aware A* global planner that leverages the predicted stability-aware velocity to generate time-efficient and risk-sensitive paths.
 Consistently avoids unsafe terrain without manual weight tuning or environment-specific adjustments.
+
+- **MPPI Local Planning**: A sampling-based local planner that tracks the global path with velocity commands bounded by the stability-aware traversability graph.
 
 
 ## Citing
@@ -152,6 +161,8 @@ Edit `statenav_global/configs/planning_config.yaml`.
 Most users only need to change `global_goal` (where to go) and `initial_start` (where to start).
 The configuration file allows users to change various parameters related to traversability mapping.
 
+⚠️ **For the bundled rosbag (Step 6), set `initialization_time: 12.0`.** The bag was recorded while the simulator ran slower than real time, so its `/clock` only covers sim time 9.9 s to 15.9 s. With the default `initialization_time: 17.0` the FSM never leaves its initialization phase during the bag, and nothing is planned. With 12.0 it switches to waypoint tracking at 12 s, which leaves about 4 s of sim time (about 30 s of playback) for planning and MPPI.
+
 ### Step 2 — Build the safe-terrain map (first terminal)
 
 ```bash
@@ -177,7 +188,32 @@ ros2 run statenav_global main_global_planning
 # then publishes planned paths for navigation.
 ```
 
-### Step 4 — Play recorded data (third terminal)
+### Step 4 — Run the navigation state machine (third terminal)
+
+```bash
+ros2 run statenav_global main_fsm
+```
+
+```bash
+# Runs the navigation finite-state machine (FSM). It starts with an initialization phase
+# (standstill, an in-place yaw sweep so the elevation map fills in around the robot, then a hold),
+# then switches to waypoint tracking. It publishes the current mode on /fsm_state.
+```
+
+### Step 5 — Track the path with MPPI (fourth terminal)
+
+```bash
+ros2 run statenav_global main_mppi
+```
+
+```bash
+# Launches the MPPI local planner. It follows /global_path using the robot pose and velocity
+# (/robot/pose, and /robot/odom or /robot/twist), issues the initialization commands the FSM
+# schedules, and publishes velocity commands on /robot/cmd_vel.
+# With the recorded bag below, the robot does not react to these commands (open loop).
+```
+
+### Step 6 — Play recorded data (fifth terminal)
 
 ```bash
 ros2 bag play $(path_to_your_ros2_workspace)/statenav_ws/src/state_nav/ROS/bag_isaac
@@ -185,11 +221,12 @@ ros2 bag play $(path_to_your_ros2_workspace)/statenav_ws/src/state_nav/ROS/bag_i
 
 ```bash
 # Plays back recorded sensor data (camera pointcloud, elevation map, path plan, etc.) from a rosbag file.
+# The bag carries its own /clock (sim time), so do not add --clock. See the initialization_time note in Step 1.
 # The above command will replay a sample recording from one of our outdoor experiments.
 # Replace $(path_to_your_ros2_workspace) with your actual ROS2 workspace path.
 ```
 
-### Step 5 — Visualize in RViz (fourth terminal)
+### Step 7 — Visualize in RViz (sixth terminal)
 
 ```bash
 rviz2 -d $(path_to_your_ros2_workspace)/statenav_ws/src/state_nav/ROS/rviz_setting.rviz
@@ -209,8 +246,38 @@ rviz2 -d $(path_to_your_ros2_workspace)/statenav_ws/src/state_nav/ROS/rviz_setti
 | 1    | Edit `planning_config.yaml` | Start, goal, and settings |
 | 2    | `main_worldmodel`           | Safe-terrain map          |
 | 3    | `main_global_planning`      | Path to goal planning     |
-| 4    | `ros2 bag play ...`         | Demo replay               |
-| 5    | `rviz2 -d ...`              | Visualization             |
+| 4    | `main_fsm`                  | Navigation mode (FSM)     |
+| 5    | `main_mppi`                 | Velocity commands (MPPI)  |
+| 6    | `ros2 bag play ...`         | Demo replay               |
+| 7    | `rviz2 -d ...`              | Visualization             |
+
+### MPPI demo without a robot (optional)
+
+`examples/demo_mppi/` runs the MPPI planner on a simulated first-order robot. With `use_shared_map:=false` it uses a flat map, so no world model is needed. Its outputs are under `/mppi_demo` (pose, odom, cmd_vel, trail, local_target, metrics).
+
+```bash
+# Terminal 1: publish a synthetic global path (path_type: straight, right_angle or detour)
+python3 examples/demo_mppi/global_path_publisher_node.py --ros-args -p path_type:=detour
+
+# Terminal 2: track it with MPPI on a flat map
+python3 examples/demo_mppi/mppi_global_path_demo_node.py --ros-args -p use_shared_map:=false
+```
+
+To run the demo on the real traversability map, start `main_worldmodel` and `main_global_planning` instead of the path publisher and leave `use_shared_map` at its default (`true`).
+
+## Using individual modules (no ROS required)
+
+Every module except `statenav_global.ros` and `executables/` (the ROS 2 nodes) imports and runs without ROS. Install only the parts you need:
+
+| Module | Import | Install |
+|---|---|---|
+| Shared-memory contract, config | `statenav_global.core` | `pip install -e .` |
+| World model (elevation / traversability graph) | `statenav_global.world_model` | `pip install -e .[worldmodel]` |
+| Global planner (A*) | `statenav_global.planners` | `pip install -e .[planners]` |
+| MPPI local planner | `statenav_mppi` | `pip install -e .[mppi]` |
+| Everything (what the ROS stack runs) | | `pip install -e .[all]` |
+
+Install the torch build for your platform (CUDA or CPU) first; pip then keeps it. Add `-c constraints.txt` to get the tested versions. The planning config defaults to `statenav_global/configs/planning_config.yaml`; set `STATENAV_PLANNING_CONFIG=/path/to/your.yaml` to use your own.
 
 ## Acknowledgments
 

@@ -39,4 +39,5 @@ gpustat>=1.1.1
 
 # -------- In-tree editable packages (installed via `pip install -e`, not from PyPI) --------
 # statenav_global      : this repo (root setup.py) — the global planner / world-model package.
+# statenav_mppi        : also installed by the root setup.py — the MPPI local planner.
 # statenav_fsm         : editable package at statenav_fsm/ — navigation FSM, QoS profiles, sim-time logger.

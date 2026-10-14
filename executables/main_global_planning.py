@@ -13,7 +13,7 @@ import statenav_global
 from statenav_global import CMDbasedMap
 from statenav_global.world_model.globalmap_with_backend import CMDbasedMapReaderProxy
 from statenav_global.world_model.shared_memory_backend import SharedMemoryBackend
-from statenav_global.utility.ros_utils import populate_map_from_float32multiarray, populate_map_from_gridmap, _elevation_z
+from statenav_global.ros.ros_utils import _elevation_z
 from statenav_global.utility.utils import wrap_to_pi
 
 # Note: tf2_ros imports available if needed for future TF operations
@@ -34,7 +34,7 @@ from statenav_fsm.qos_profiles import (
 # wall clock and cannot be retargeted to /clock, so the mixin prepends the node's ROS clock
 # reading to the MESSAGE instead (see statenav_fsm/sim_time_logger.py).
 from statenav_fsm.sim_time_logger import SimTimeLoggerMixin
-from std_msgs.msg import Float32MultiArray, Bool, String
+from std_msgs.msg import Bool, String
 from grid_map_msgs.msg import GridMap
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
@@ -44,7 +44,8 @@ import warnings
 warnings.simplefilter(action='ignore', category=RuntimeWarning)
 
 from pathlib import Path as PathLib
-cfg = OmegaConf.load(PathLib(statenav_global.__file__).parent / "configs/planning_config.yaml")
+from statenav_global.core.config import load_planning_config
+cfg = load_planning_config()   # $STATENAV_PLANNING_CONFIG, else the packaged planning_config.yaml
 
 
 def set_random_seed(seed):
@@ -130,7 +131,14 @@ class PlanningNode(SimTimeLoggerMixin, Node):
 
         # Check if using shared memory mode
         self.use_shared_memory = self.cfg.get('use_shared_memory', False)
-        
+        # Guard: only shared-memory mode exists. Traversability lives only in the world model's
+        # shared graph; the ROS-message mode that received a dense /global_costmap was removed.
+        if not self.use_shared_memory:
+            raise RuntimeError(
+                f"[PathPlanner] use_shared_memory={self.use_shared_memory!r} in planning_config.yaml, "
+                f"but only shared-memory mode is supported (traversability lives only in the shared "
+                f"graph; the dense /global_costmap mode was removed). Set use_shared_memory: True.")
+
         # Calculate task extent
         self.task_extent = [
             self.cfg.env_extent[0] + 1*self.cfg.local_patch_size,
@@ -155,33 +163,15 @@ class PlanningNode(SimTimeLoggerMixin, Node):
 
 
 
-        # Initialize map based on mode
-        if self.use_shared_memory:
-            # Shared memory mode: attach to shared memory created by WorldModel
-            self.get_logger().info("[PathPlanner] Initializing in SHARED MEMORY mode (reader, named)")
-            backend = SharedMemoryBackend(mode='reader')
-            self.global_map = CMDbasedMapReaderProxy(backend)
-            # Set goal after initialization
-            self.global_map.goal_x = global_goal[0]
-            self.global_map.goal_y = global_goal[1]
+        # Initialize map: attach to shared memory created by WorldModel (the only mode)
+        self.get_logger().info("[PathPlanner] Initializing in SHARED MEMORY mode (reader, named)")
+        backend = SharedMemoryBackend(mode='reader')
+        self.global_map = CMDbasedMapReaderProxy(backend)
+        # Set goal after initialization
+        self.global_map.goal_x = global_goal[0]
+        self.global_map.goal_y = global_goal[1]
 
-        if not self.use_shared_memory:
-            # ROS message mode: create map and subscribe to topics
-            self.get_logger().info("[PathPlanner] Initializing in ROS MESSAGE mode")
-            self.global_map = CMDbasedMap(
-                env_xmin=self.cfg.env_extent[0],
-                env_xmax=self.cfg.env_extent[1],
-                env_ymin=self.cfg.env_extent[2],
-                env_ymax=self.cfg.env_extent[3],
-                goal_x=global_goal[0],
-                goal_y=global_goal[1],
-                which_layer=self.cfg.which_layer,
-                preest_update_resolution=self.cfg.trav_estimation_resoultion,
-                instab_limit=self.cfg.instability_limit,
-                load_Travformer=False,
-            )
-        
-        self.get_logger().info(f"[PathPlanner] Map class initialized. Type: {type(self.global_map).__name__}, Mode: {'SHARED MEMORY' if self.use_shared_memory else 'ROS MESSAGE'}")
+        self.get_logger().info(f"[PathPlanner] Map class initialized. Type: {type(self.global_map).__name__}, Mode: SHARED MEMORY")
         
 
 
@@ -257,32 +247,18 @@ class PlanningNode(SimTimeLoggerMixin, Node):
         #   level4 -> /logging/log_dir, latched (see below)
         # level1 is unused here: this node consumes no sensor streams.
 
-        # Subscribers (different based on mode)
-        if self.use_shared_memory:
-            # Shared memory mode: subscribe to pose and replanning signal via ROS
-            self.create_subscription(PoseStamped, "/robot/pose", self.pose_callback, qos_profile_level3)
-            self.create_subscription(Bool, "/replanning_signal", self.replanning_callback, qos_profile_level2)
-            self.get_logger().info("[PathPlanner] Subscribed to /robot/pose and /replanning_signal (shared memory mode)")
-        else:
-            # ROS message mode: subscribe to map topics and pose
-            self.use_gridmap_msg = self.cfg.get('use_gridmap_msg', False)
-            if self.use_gridmap_msg:
-                self.create_subscription(GridMap, "/global_costmap", self.map_callback, qos_profile_level2)
-                self.get_logger().info("[PathPlanner] Subscribed to /global_costmap (GridMap)")
-            else:
-                self.create_subscription(Float32MultiArray, "/global_costmap", self.map_callback, qos_profile_level2)
-                self.get_logger().info("[PathPlanner] Subscribed to /global_costmap (Float32MultiArray)")
+        # Subscribers (shared memory mode): pose and replanning signal via ROS
+        self.create_subscription(PoseStamped, "/robot/pose", self.pose_callback, qos_profile_level3)
+        self.create_subscription(Bool, "/replanning_signal", self.replanning_callback, qos_profile_level2)
+        self.get_logger().info("[PathPlanner] Subscribed to /robot/pose and /replanning_signal (shared memory mode)")
 
-            self.create_subscription(PoseStamped, "/robot/pose", self.pose_callback, qos_profile_level3)
-            self.get_logger().info("[PathPlanner] Subscribed to /robot/pose")
-
-        # Subscribe to FSM state (both modes)
+        # Subscribe to FSM state
         self.create_subscription(String, "/fsm_state", self._fsm_state_callback, qos_profile_level2)
         self.get_logger().info("[PathPlanner] Subscribed to /fsm_state")
 
         # Subscribe (latched) to the experiment log directory published by IsaacLab when
         # logging starts. On receipt we schedule a one-time dump of the initial elevation
-        # map and traversability map into
+        # map into
         # <log_dir>/initial/. transient_local matches the latched publisher so we still
         # receive it even if IsaacLab published before this node subscribed. level4 of the
         # shared ladder is exactly that latched (TRANSIENT_LOCAL) profile.
@@ -334,7 +310,6 @@ class PlanningNode(SimTimeLoggerMixin, Node):
         # map/graph first. A bootstrap request here would defeat that gate
         # by planning prematurely.
         self._replan_pending = False
-        self._new_map_event = threading.Event()  # signals a new map is ready (ROS message mode)
 
         # FSM state tracking
         self.current_fsm_state = "WP_TRACKING"
@@ -433,40 +408,6 @@ class PlanningNode(SimTimeLoggerMixin, Node):
 
 
 
-    def map_callback(self, msg):
-        """Handle incoming map message and trigger planning (ROS message mode only)."""
-        if self.use_shared_memory:
-            self.get_logger().warning("[PathPlanner] map_callback called in shared memory mode. This should not happen.")
-            return
-        
-        if self.planning_in_progress:
-            # Note: ROS2 throttling is done differently - using timer-based approach or manual check
-            if not hasattr(self, '_last_warning_time'):
-                self._last_warning_time = 0.0
-            current_time = self.get_clock().now().nanoseconds / 1e9
-            if current_time - self._last_warning_time > 1.0:
-                self.get_logger().warning("[PathPlanner] Planning in progress, skipping map update")
-                self._last_warning_time = current_time
-            return
-
-        if self.get_clock().now().nanoseconds / 1e9 < self.initialization_time:
-            return
-        
-        # Update map data using helper functions
-        success = False
-        if self.use_gridmap_msg:
-            success = populate_map_from_gridmap(self.global_map, msg, node=self)
-        else:
-            success = populate_map_from_float32multiarray(self.global_map, msg, node=self)
-        
-        if not success:
-            self.get_logger().warning("[PathPlanner] Failed to update map from message")
-            return
-
-        # Signal the main run loop that a new map is ready
-        self._new_map_event.set()
-    
-    
 ####################################### FSM PER-STATE ACTIONS #######################################
 
     def _run_WP_TRACKING(self, current_time):
@@ -547,7 +488,7 @@ class PlanningNode(SimTimeLoggerMixin, Node):
 
         Reuses the exact visualization paths the user referenced. Each sub-dump is guarded
         independently so one failing (e.g. missing planner state) does not block the others:
-          - global_map.visualize_maps(..., save_dir)  -> 'World Elevation Map.pdf', 'Traversability Map.pdf'
+          - global_map.visualize_maps(..., save_dir)  -> 'World Elevation Map.pdf' (no dense trav map any more)
 
         Rendering is forced headless: the plotting helpers pop up GUI windows
         (plt.show(block=False)/plt.pause()). The global-planner process selects the non-GUI 'Agg'
@@ -619,7 +560,7 @@ class PlanningNode(SimTimeLoggerMixin, Node):
         print("=" * 72)
         print(replan_msg)
 
-    def plan_and_publish(self, forced_start=None):
+    def plan_and_publish(self):
         """Run global planning and publish the path."""
         if not self.global_map.is_TraversabilityMap_built:
             self.get_logger().warning("[PathPlanner] Map not built yet, cannot plan")
@@ -636,7 +577,6 @@ class PlanningNode(SimTimeLoggerMixin, Node):
                 initial_start=(self.initial_start[0], self.initial_start[1]),
                 total_lookahead_time=self.waypoint_lookahead_time,
                 plot_map=False,
-                forced_start=forced_start
             )
 
             # Single plan-summary line: solver time + plan ETA.
@@ -716,16 +656,8 @@ class PlanningNode(SimTimeLoggerMixin, Node):
                 if self.current_fsm_state == "WP_TRACKING":
                     self._replan_pending = False
                     self._run_WP_TRACKING(current_time)
-        else:
-            self.get_logger().info("[PathPlanner] Planning Node started (ROS message mode). Waiting for map updates...")
-            while rclpy.ok():
-                triggered = self._new_map_event.wait(timeout=1.0)
-                self._new_map_event.clear()
-                if not triggered:
-                    continue
-                current_time = self.get_clock().now().nanoseconds / 1e9
-                if self.current_fsm_state == "WP_TRACKING":
-                    self._run_WP_TRACKING(current_time)
+        # (No else branch: the ROS-message mode loop was removed; __init__ refuses
+        #  use_shared_memory=False.)
 
 def main():
     rclpy.init()

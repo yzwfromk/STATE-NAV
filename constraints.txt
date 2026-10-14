@@ -1,0 +1,14 @@
+# Tested versions (Python 3.10, ROS 2 Humble). Use as a pip
+# constraints file: it pins versions but installs nothing by itself, e.g.
+#     pip install -c constraints.txt -e .[worldmodel]
+# torch / torchvision are deliberately absent: they are platform-specific builds (x86 CUDA wheel
+# 2.7.0+cu128 / 0.22.0+cu128 here, the system build on Jetson Orin). Install them first.
+numpy==1.26.4
+scipy==1.11.4
+matplotlib==3.8.4
+hydra-core==1.1.0
+omegaconf==2.1.2
+antlr4-python3-runtime==4.8
+PyYAML==6.0.3
+transforms3d==0.4.2
+pillow==12.1.1

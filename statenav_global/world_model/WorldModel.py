@@ -12,7 +12,8 @@ from omegaconf import OmegaConf
 
 # Load config from package data
 _PKG_ROOT = Path(__file__).resolve().parent.parent
-cfg = OmegaConf.load(_PKG_ROOT / "configs/planning_config.yaml")
+from statenav_global.core.config import load_planning_config
+cfg = load_planning_config()   # $STATENAV_PLANNING_CONFIG, else the packaged planning_config.yaml
 
 
 class WorldModel:
@@ -42,9 +43,11 @@ class WorldModel:
         if global_goal is None:
             global_goal = cfg.global_goal
 
+        # Map extent: env_extent [xmin, xmax, ymin, ymax] in metres.
+        env_extent = [float(v) for v in cfg.env_extent]
         return CMDbasedMap(
-            env_xmin=cfg.env_extent[0], env_xmax=cfg.env_extent[1],
-            env_ymin=cfg.env_extent[2], env_ymax=cfg.env_extent[3],
+            env_xmin=env_extent[0], env_xmax=env_extent[1],
+            env_ymin=env_extent[2], env_ymax=env_extent[3],
             goal_x=global_goal[0], goal_y=global_goal[1],
             which_layer=cfg.which_layer,
             preest_update_resolution=cfg.trav_estimation_resoultion,
@@ -72,11 +75,13 @@ class WorldModel:
                 from statenav_global.world_model.shared_memory_backend import SharedMemoryBackend
                 backend = SharedMemoryBackend(mode='writer')
             
+            # Map extent: env_extent [xmin, xmax, ymin, ymax] in metres.
+            env_extent = [float(v) for v in cfg.env_extent]
             self.global_map = CMDbasedMapWithBackend(
-                env_xmin=cfg.env_extent[0],
-                env_xmax=cfg.env_extent[1],
-                env_ymin=cfg.env_extent[2],
-                env_ymax=cfg.env_extent[3],
+                env_xmin=env_extent[0],
+                env_xmax=env_extent[1],
+                env_ymin=env_extent[2],
+                env_ymax=env_extent[3],
                 goal_x=cfg.global_goal[0],
                 goal_y=cfg.global_goal[1],
                 which_layer=cfg.which_layer,
@@ -89,8 +94,12 @@ class WorldModel:
             if rospy:
                 rospy.loginfo("[WorldModel] WorldModel initialized with shared memory backend (writer mode)")
         else:
-            # Use regular map (single process) - create based on config
-            self.global_map = WorldModel.create_map_from_config()
+            # Guard: a regular (single-process) map owns no shared graph, which is the only
+            # traversability store, so every traversability write would fail later. Refuse here.
+            raise RuntimeError(
+                "[WorldModel] use_shared_memory=False with no backend is no longer supported: "
+                "traversability lives only in the shared graph that CMDbasedMapWithBackend "
+                "builds. Construct WorldModel(use_shared_memory=True) (config: use_shared_memory: True).")
 
 
         # Global Planning
@@ -159,15 +168,17 @@ class WorldModel:
 
         # Guard: the gate is defined purely on shared-graph writer counters. With no graph
         # writer nothing ever increments them, so gating would mean never replanning again.
-        # The graph is built only when global_planner_type == "Astar" (see _build_shared_graph),
-        # and never on a reader proxy / use_shared_memory: False. Fall back to the previous
-        # unconditional behavior and say so once.
-        if getattr(self.global_map, 'graph_writer', None) is None:
+        # The graph is now built for every planner type, but the gate stays an Astar-only
+        # policy: non-Astar planners keep their unconditional per-tick replan request,
+        # exactly as before the graph existed for them. Fall back to that and say so once.
+        _gate_planner = str(cfg.get('global_planner_type', 'Astar')) == "Astar"
+        if getattr(self.global_map, 'graph_writer', None) is None or not _gate_planner:
             if not self._replan_gate_disabled_warned:
-                print("[WorldModel] WARNING: global_map has no shared-graph writer, so the "
-                      "replanning change gate has no counters to read; falling back to a "
-                      "replan request on every WP_TRACKING tick (previous behavior). "
-                      "Expected with global_planner_type != Astar or use_shared_memory: False.")
+                print("[WorldModel] WARNING: replanning change gate disabled "
+                      f"(graph writer present={getattr(self.global_map, 'graph_writer', None) is not None}, "
+                      f"global_planner_type={cfg.get('global_planner_type', 'Astar')!r}); falling back "
+                      "to a replan request on every WP_TRACKING tick (previous behavior). "
+                      "Expected with global_planner_type != Astar.")
                 self._replan_gate_disabled_warned = True
             return True
 
